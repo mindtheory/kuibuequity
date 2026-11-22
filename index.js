@@ -331,15 +331,37 @@ function apply(ctx, config) {
           if (typeof short.scoreCandidates !== 'function') return moduleMissing('scoreCandidates', './src/strategies/shortTerm.js');
           if (!args.symbols) return { ok: false, code: 'ERR-INTERNAL', message: 'scan 需要 symbols（逗号分隔候选池；本插件不自动拉全市场列表）' };
           const list = String(args.symbols).split(/[,，\s]+/).filter(Boolean);
-          const quotes = [];
-          const barsMap = {};
+          const candidates = [];
           for (const s of list) {
-            quotes.push(await quote(s, { timeoutMs }));
-            barsMap[s] = (await dailyBars(s, { days: 60, adjust, timeoutMs })).bars;
+            try {
+              const q = await quote(s, { timeoutMs });
+              const barsRes = await dailyBars(s, { days: 60, adjust, timeoutMs });
+              const bars = barsRes.bars;
+              const last = bars[bars.length - 1] || {};
+              const closes = bars.map((b) => b.adjClose ?? b.close);
+              const vols = bars.map((b) => b.volume);
+              const volMa5 = vols.slice(-6, -1).reduce((a, b) => a + b, 0) / 5;
+              candidates.push({
+                symbol: q.symbol, name: q.name,
+                gainPct: q.changePct != null ? q.changePct / 100 : (closes.length > 1 ? closes.at(-1) / closes.at(-2) - 1 : 0),
+                turnover: q.turnoverRate ?? 0,
+                volumeRatio: volMa5 > 0 ? (q.volume ?? last.volume ?? 0) / volMa5 : 1,
+                limitUp: q.limitUp != null && q.price >= q.limitUp - 1e-9,
+                blown: false, firstLimitTime: null, boards: 1,
+                floatCap: q.floatCap ?? 1e10, st: /ST/i.test(q.name || ''),
+                oneWordBoard: false, sealAmount: 0, mainNetInflow: 0,
+                amount: q.amount ?? last.amount ?? 0,
+                amount20Avg: bars.slice(-20).reduce((a, b) => a + (b.amount || 0), 0) / Math.max(1, Math.min(20, bars.length)),
+                listDays: bars.length, sectorLimitUps: 0,
+              });
+            } catch { /* 单票行情失败：跳过该票，不拖垮整池（P6：不伪造成交） */ }
           }
           const idx = await indexBars('000300', { days: 60, timeoutMs });
-          const ranked = short.scoreCandidates({ quotes, barsMap, indexBars: idx.bars, config: {} });
-          return { ok: true, candidates: (ranked || []).slice(0, args.topN || 10), asOf: idx.asOf, footnotes: [DISCLAIMER] };
+          const idxCloses = idx.bars.map((b) => b.adjClose ?? b.close);
+          const ma5 = idxCloses.slice(-5).reduce((a, b) => a + b, 0) / Math.min(5, idxCloses.length);
+          const market = { indexAboveMa5: idxCloses.at(-1) >= ma5, yesterdayLimitUpPremium: null, blowUpRate: null };
+          const ranked = short.scoreCandidates({ candidates, market, config: {}, topN: args.topN || 10 });
+          return { ok: true, sentimentOpen: ranked.open, sentimentReason: ranked.reason, candidates: ranked.candidates, asOf: idx.asOf, footnotes: [DISCLAIMER] };
         }
         if (args.action === 'exit') {
           if (!args.symbol) return { ok: false, code: 'ERR-SYMBOL-001', message: 'exit 需要 symbol' };
@@ -426,7 +448,7 @@ function apply(ctx, config) {
             action: args.actionName || 'buy',
             quadrant: args.mode,
             signal: { qty: 1, price: args.signalValue || 0 },
-            account: { totalAsset: args.accountValue || 0 },
+            account: { equity: args.accountValue || 0, symbolValue: {} },
             stats: null,
             config: {},
           });

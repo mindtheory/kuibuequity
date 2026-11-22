@@ -15,6 +15,7 @@ export const meta = {
   horizon: '≤20 交易日',
   description: '不追求最高收益，赚 1~5% 就走；用事前契约与条件单对抗贪婪与不甘',
   configSchema: {
+    targetPct: { default: null, range: [0.01, 0.05] }, // 显式止盈目标；null=按 ATR 自适应
     targetMinPct: { default: 0.01 },
     targetMaxPct: { default: 0.05 },
     targetVolMult: { default: 2.0 },
@@ -30,13 +31,16 @@ const defaults = Object.fromEntries(Object.entries(meta.configSchema).map(([k, v
 /**
  * 止盈目标自适应（design.md §5.2）
  * t = clamp(2×ATR14%, 1%, 5%)；s = −0.8t；仓位 = riskPerTrade / |s|
+ * config.targetPct 显式给定时直接采用（仍 clamp 到 [targetMin, targetMax]）
  */
 export function adaptiveTarget({ bars, config = {} }) {
   const cfg = { ...defaults, ...config };
   const ap = atrPct(bars, 14).filter((v) => v !== null);
   if (!ap.length) throw new Error('ERR-DATA-002: ATR 数据不足，无法自适应目标');
   const vol = ap[ap.length - 1];
-  const targetPct = Math.min(cfg.targetMaxPct, Math.max(cfg.targetMinPct, vol * cfg.targetVolMult));
+  const targetPct = cfg.targetPct != null
+    ? Math.min(cfg.targetMaxPct, Math.max(cfg.targetMinPct, Number(cfg.targetPct)))
+    : Math.min(cfg.targetMaxPct, Math.max(cfg.targetMinPct, vol * cfg.targetVolMult));
   const stopLossPct = -cfg.stopRatio * targetPct;
   const rawPositionPct = cfg.riskPerTrade / Math.abs(stopLossPct);
   return {
@@ -91,6 +95,9 @@ export function entryChecks({ bars, indexBars, config = {} }) {
  * 契约锁定：contract 的 t/s/D 建仓时写死，改需 override（risk.js/ledger.js 负责审计）
  */
 export function checkPosition({ bars, contract, position }) {
+  if (!contract || !position) {
+    return { action: 'hold', hitRule: 'STABLE.NO_CONTRACT', detail: '该标的无持仓或无事前契约：先用 kb_stable contract 建仓契约，再体检', conditionOrders: [] };
+  }
   const last = bars[bars.length - 1];
   const px = last.adjClose ?? last.close;
   const entry = Number(contract.entry.price);
