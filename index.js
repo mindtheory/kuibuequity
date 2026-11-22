@@ -16,6 +16,7 @@ import { quote, dailyBars, dividends, indexBars } from './src/market.js';
 import { RED_LINES, gate, expectancyCheck, sentimentGate, hardExitCheck } from './src/risk.js';
 import { resolveFee, tradeFee } from './src/costs.js';
 import { winRate, payoffRatio, maxDrawdown } from './src/indicators.js';
+import { registerWebRoutes } from './src/webapi.js';
 
 const name = 'kuibuequity';
 const inject = ['tools', 'systemPrompt'];
@@ -580,6 +581,13 @@ function apply(ctx, config) {
   }));
 
   // ---- systemPrompt：让模型知道三象限纪律与工具面 ----
+  // ---- Web 面板 API（/api/kuibuequity/*，loopback 守卫）----
+  try {
+    registerWebRoutes({ ctx, config: resolved, dataDir, fee, timeoutMs, adjust });
+  } catch (err) {
+    console.warn('[kuibuequity] web routes failed:', err && err.message);
+  }
+
   ctx.systemPrompt.section({
     name: 'kuibuequity',
     order: 170,

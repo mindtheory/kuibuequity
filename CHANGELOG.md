@@ -6,6 +6,13 @@
 
 ### Added
 
+- **Web GUI 面板（M5）**：`client.js` 浏览器半区——DSH 侧栏「跬步量化」入口 + 主区三象限驾驶舱
+  （总览/持仓/指令单/个股体检/复盘 五 Tab；情绪总闸灯、成本转负进度条、条件单 CSV 导出、象限建账入口）
+- **面板 API** `src/webapi.js`：`/api/kuibuequity/{state,init,trade,quote,sentiment,plan,check,review}`
+  8 路由；loopback 守卫（allowLanState 默认 false）；错误统一 `{ok:false,code,message}`
+- 设计文档 `docs/web-panel.md`（挂载方式、与参考插件的优化差异、API 表、安全边界）
+- 测试：webapi 路由 8 条（mock webServer 端到端 handler 调用）；3099 自检实例验证
+  插件挂载、state/init/trade 写链路、断网 sentiment 优雅降级、client.js 进入分发 bundle
 - **契约落库联动**：`kb_account action=trade` 在 `stable` 象限录入买入成交时，自动按 `adaptiveTarget`
   的 t/s/D 生成并锁定建仓契约（`src/strategies/stable.js` 新增纯函数 `buildLockedContract`），
   与成交在**同一次 `save()`** 内落库；`trade.contractId` 与 `positions().contractId` 由同一契约表推导，

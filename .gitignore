@@ -10,6 +10,7 @@ npm-debug.log*
 data/
 *.ledger.json
 audit.jsonl
+.sa-results/
 
 # 环境与凭据
 .env
