@@ -17,9 +17,15 @@ export const DEFAULT_FEE = {
 const round2 = (x) => Math.round((x + Number.EPSILON) * 100) / 100;
 const round3 = (x) => Math.round((x + Number.EPSILON) * 1000) / 1000;
 
-/** 合并用户费率覆盖，缺省回落默认值 */
+/** 合并用户费率覆盖：只接受有限数值，undefined/null/NaN 一律回落默认值 */
 export function resolveFee(overrides = {}) {
-  return { ...DEFAULT_FEE, ...(overrides || {}) };
+  const out = { ...DEFAULT_FEE };
+  for (const [k, v] of Object.entries(overrides || {})) {
+    if (!(k in DEFAULT_FEE)) continue;
+    const n = Number(v);
+    if (Number.isFinite(n)) out[k] = n;
+  }
+  return out;
 }
 
 /**
