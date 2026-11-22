@@ -185,12 +185,15 @@ export function makeLedger(dataDir) {
   // ---------- 成交流水 ----------
 
   /**
-   * 录入一笔成交并联动现金与审计
+   * 录入一笔成交并联动现金与审计；可选携带契约草案（P5 事前承诺），与成交同一次落盘
    * @param {{quadrant:string, symbol:string, side:'buy'|'sell', price:number, qty:number,
-   *          fee?:number, date?:string, note?:string, name?:string, dividend?:number}} p
+   *          fee?:number, date?:string, note?:string, name?:string, dividend?:number,
+   *          contract?:object}} p
    *        dividend = 该笔持有期间的**每股**现金分红（可选，契约未列字段，见文件末"实现取舍"）
+   *        contract = 契约草案（docs/interface.md §4/§7.2）：无既有契约时新建并锁定；
+   *                   已有契约时复用其 id（加仓不新建，t/s/D 保持锁定）
    */
-  function recordTrade({ quadrant, symbol, side, price, qty, fee, date, note, name, dividend }) {
+  function recordTrade({ quadrant, symbol, side, price, qty, fee, date, note, name, dividend, contract }) {
     if (side !== 'buy' && side !== 'sell') throw ledgerError('ERR-LEDGER-001', `side 必须是 buy/sell，收到 ${JSON.stringify(side)}`);
     if (!symbol || typeof symbol !== 'string') throw ledgerError('ERR-SYMBOL-001', 'recordTrade 需要 symbol');
     const p = Number(price);
@@ -204,6 +207,19 @@ export function makeLedger(dataDir) {
     // 费用口径唯一：调用方未给 fee 时回落 costs.tradeFee（P4）
     const f = fee == null ? tradeFee({ side, price: p, qty: q }) : round2(Number(fee));
     if (!Number.isFinite(f) || f < 0) throw ledgerError('ERR-LEDGER-001', `fee 非法：${JSON.stringify(fee)}`);
+
+    // 契约草案先校验：任何不一致必须在改内存态之前抛出（失败不落库）
+    if (contract != null) {
+      if (typeof contract !== 'object' || Array.isArray(contract)) {
+        throw ledgerError('ERR-CONTRACT-001', 'contract 必须是契约草案对象');
+      }
+      if (contract.quadrant != null && contract.quadrant !== quadrant) {
+        throw ledgerError('ERR-CONTRACT-001', `契约草案象限 ${contract.quadrant} 与成交象限 ${quadrant} 不一致`);
+      }
+      if (contract.symbol != null && contract.symbol !== symbol) {
+        throw ledgerError('ERR-CONTRACT-001', `契约草案标的 ${contract.symbol} 与成交标的 ${symbol} 不一致`);
+      }
+    }
 
     const amount = round2(p * q);
     const before = { cash: acc.cash };
@@ -249,6 +265,32 @@ export function makeLedger(dataDir) {
       after: { cash: acc.cash, qty: q, price: trade.price, fee: f },
       reason: note ?? null,
     });
+
+    // 成交 ↔ 契约联动：契约表只在同一份 state 上改，最后一次 save() 保证原子
+    if (contract != null) {
+      const existing = latestContract(state, quadrant, symbol);
+      if (existing) {
+        // 加仓不新建契约：t/s/D 建仓时已锁定，改基准必须显式 override（P5）
+        trade.contractId = existing.id;
+        auditAppend({
+          action: 'contract.reuse',
+          target: `${quadrant}/${symbol}`,
+          before: null,
+          after: { id: existing.id, takeProfitPct: existing.takeProfitPct, stopLossPct: existing.stopLossPct, maxHoldDays: existing.maxHoldDays },
+          reason: '加仓沿用既有契约（t/s/D 保持锁定，改基准请显式 override）',
+        });
+      } else {
+        const record = appendContract(state, {
+          ...contract,
+          quadrant,
+          symbol,
+          entry: contract.entry ?? { price: p, qty: q, date: trade.date },
+          note: contract.note ?? '随成交自动锁定建仓契约',
+        });
+        trade.contractId = record.id;
+      }
+    }
+
     save(state);
     return { ...trade };
   }
@@ -302,11 +344,7 @@ export function makeLedger(dataDir) {
     for (const g of groups.values()) {
       const hc = holdingCost({ lots: g.lots, opts: { includeDividend: true } });
       if (hc.shares <= 0) continue; // 已清仓的不算持仓
-      const contract =
-        state.contracts
-          .filter((c) => c.quadrant === g.quadrant && c.symbol === g.symbol)
-          .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)))
-          .pop() || null;
+      const contract = latestContract(state, g.quadrant, g.symbol);
       out.push({
         quadrant: g.quadrant,
         symbol: g.symbol,
@@ -329,16 +367,25 @@ export function makeLedger(dataDir) {
     return load().contracts.map((c) => ({ ...c }));
   }
 
+  /** 某象限某标的的最新契约（无则 null）；positions() 与 recordTrade() 共用同一口径 */
+  function latestContract(state, quadrant, symbol) {
+    return (
+      state.contracts
+        .filter((c) => c.quadrant === quadrant && c.symbol === symbol)
+        .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)))
+        .pop() || null
+    );
+  }
+
   /**
-   * 新建事前契约：建仓时锁定止盈/止损/期限，locked 恒为 true
-   * @param {object} c Contract 的输入子集
+   * 构造并追加一条契约记录（addContract 与 recordTrade 共用，字段口径唯一）
+   * 只改内存 state + 写审计，落盘由调用方决定（成交联动时与成交同一次 save）
    */
-  function addContract(c) {
-    if (!c || typeof c !== 'object') throw ledgerError('ERR-CONTRACT-001', 'addContract 需要一个契约对象');
+  function appendContract(state, c) {
+    if (!c || typeof c !== 'object') throw ledgerError('ERR-CONTRACT-001', '契约需要一个对象');
     const { quadrant, symbol } = c;
     assertQuadrant(quadrant);
     if (!symbol || typeof symbol !== 'string') throw ledgerError('ERR-SYMBOL-001', '契约需要 symbol');
-    const state = load();
     requireQuadrant(state, quadrant); // 契约必须挂在已建账的象限上
 
     const entry = c.entry && typeof c.entry === 'object' ? c.entry : {};
@@ -359,6 +406,7 @@ export function makeLedger(dataDir) {
       createdAt: nowIso(),
       overrides: [],
     };
+    if (c.source != null) contract.source = String(c.source);
     state.contracts.push(contract);
     auditAppend({
       action: 'contract.add',
@@ -367,6 +415,16 @@ export function makeLedger(dataDir) {
       after: { id: contract.id, takeProfitPct: contract.takeProfitPct, stopLossPct: contract.stopLossPct, maxHoldDays: contract.maxHoldDays, locked: true },
       reason: c.note ?? '建立事前契约',
     });
+    return contract;
+  }
+
+  /**
+   * 新建事前契约：建仓时锁定止盈/止损/期限，locked 恒为 true
+   * @param {object} c Contract 的输入子集
+   */
+  function addContract(c) {
+    const state = load();
+    const contract = appendContract(state, c);
     save(state);
     return { ...contract };
   }
@@ -516,4 +574,7 @@ export function makeLedger(dataDir) {
  * 4. transfer 额外要求 reason（design.md §6.6 要求调拨写审计，无理由无法复盘）。
  * 5. 卖出持仓校验按"同象限同标的流水净额"推得（跨象限物理隔离，禁止用别的象限持仓抵卖）。
  * 6. 金额落盘统一 2 位小数、价格 3 位小数（interface.md 约定）；比较时留 1e-9 容差避免浮点误判。
+ * 7. recordTrade 可选 contract（契约草案）：与成交在同一次 save() 内落库（成交 ↔ 契约原子一致）；
+ *    同象限同标的已有契约时复用其 id 并写 contract.reuse 审计（加仓不新建契约，t/s/D 保持锁定）；
+ *    草案 quadrant/symbol 与成交不一致 → ERR-CONTRACT-001，整笔不落库。
  */

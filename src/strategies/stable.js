@@ -91,6 +91,40 @@ export function entryChecks({ bars, indexBars, config = {} }) {
 }
 
 /**
+ * 建仓契约草案（P5：事前承诺，纯函数）
+ *
+ * t/s/D 全部来自 adaptiveTarget（不猜、不硬凑）；entry 必须来自真实成交。
+ * 落库由 ledger.recordTrade({ contract }) 在同一次 save() 内完成（成交 ↔ 契约原子一致），
+ * 事后修改只能走 ledger.overrideContract（必须 reason，写审计）。
+ *
+ * @param {{bars:object[], symbol:string, entry:{price:number, qty:number, date?:string},
+ *          config?:object, note?:string}} p
+ * @returns {object} 契约草案（见 docs/interface.md §7.2）
+ */
+export function buildLockedContract({ bars, symbol, entry, config = {}, note } = {}) {
+  if (!symbol || typeof symbol !== 'string') throw new Error('ERR-SYMBOL-001: 建仓契约需要 symbol');
+  const price = Number(entry?.price);
+  const qty = Number(entry?.qty);
+  if (!(price > 0) || !Number.isInteger(qty) || qty <= 0) {
+    throw new Error(`ERR-CONTRACT-001: 建仓契约需要合法 entry.price/qty，收到 price=${entry?.price} qty=${entry?.qty}`);
+  }
+  const target = adaptiveTarget({ bars, config });
+  return {
+    quadrant: 'stable',
+    symbol,
+    mode: 'stable',
+    entry: { price: Math.round(price * 1000) / 1000, qty, date: entry?.date ?? null },
+    takeProfitPct: target.targetPct,
+    stopLossPct: target.stopLossPct,
+    maxHoldDays: target.maxHoldDays,
+    source: 'adaptiveTarget',
+    note:
+      note ??
+      `建仓自动锁定：t=+${(target.targetPct * 100).toFixed(2)}% / s=${(target.stopLossPct * 100).toFixed(2)}% / D=${target.maxHoldDays}日（adaptiveTarget）`,
+  };
+}
+
+/**
  * 持仓体检（契约驱动）：止盈/止损/时间到期 → 动作 + 条件单参数
  * 契约锁定：contract 的 t/s/D 建仓时写死，改需 override（risk.js/ledger.js 负责审计）
  */

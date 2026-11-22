@@ -2,6 +2,28 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 格式，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### Added
+
+- **契约落库联动**：`kb_account action=trade` 在 `stable` 象限录入买入成交时，自动按 `adaptiveTarget`
+  的 t/s/D 生成并锁定建仓契约（`src/strategies/stable.js` 新增纯函数 `buildLockedContract`），
+  与成交在**同一次 `save()`** 内落库；`trade.contractId` 与 `positions().contractId` 由同一契约表推导，
+  成交 → 契约 → 持仓三者 id 自洽。加仓复用既有契约 id（`contract.reuse` 审计），不自动改 t/s/D。
+- **补建契约**：`kb_stable action=contract` 在既有 stable 持仓尚无契约时（如建仓时行情不可用）补建并锁定，
+  已有契约则原样返回、不重复创建。
+- **测试**：`test/contract-link.test.js` 8 条用例（ATR 手算对齐 t=4%/s=−3.2%、clamp、草案诚实失败、
+  原子落库与 id 自洽、加仓复用、不一致整笔回滚、override 审计）。
+
+### Changed（契约变更，`docs/interface.md` 已同步）
+
+- `ledger.recordTrade` 新增可选参数 `contract`（契约草案），返回值 `Trade` 可含 `contractId`；
+  草案 `quadrant/symbol` 与成交不一致 → `ERR-CONTRACT-001`，整笔不落库。
+- `stable.buildLockedContract({ bars, symbol, entry, config })` 纳入接口契约（§7.2）；
+  entry 必须来自真实成交，bars 不足仍由 `adaptiveTarget` 抛 `ERR-DATA-002`（P6 不编造 t/s）。
+- `kb_account`/`kb_stable` 工具描述与 `days` 参数同步；行情不可用时 `kb_account trade` 照常记账，
+  但返回 `warning: ERR-DATA-001` 且不生成契约（诚实失败，不伪造止盈止损）。
+
 ## [0.1.0] - 2026-11-22
 
 首个版本：设计冻结 + 纯函数内核 + 三象限策略 + 行情层 + DSH 工具注册。

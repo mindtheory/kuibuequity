@@ -120,7 +120,8 @@ export function makeLedger(dataDir): {
   load(): State, save(State): void,
   accounts(): Quadrant[],
   initAccount({ quadrant, cash, totalAsset }): Quadrant,
-  recordTrade({ quadrant, symbol, side, price, qty, fee, date, note }): Trade,
+  recordTrade({ quadrant, symbol, side, price, qty, fee, date, note, dividend,
+                contract? }): Trade,
   positions(quadrant?): Position[],
   contracts(): Contract[],
   addContract(Contract): Contract,
@@ -140,11 +141,23 @@ export function makeLedger(dataDir): {
 Quadrant  = { quadrant, cash, initialCash, updatedAt }
 Position  = { quadrant, symbol, name, qty, avgPrice, costPerShare, negative,
               dividends, openDate, contractId|null }
-Trade     = { id, quadrant, symbol, side, price, qty, fee, amount, date, createdAt, note }
+Trade     = { id, quadrant, symbol, side, price, qty, fee, amount, date, createdAt, note,
+              contractId? }   // 仅当本笔成交带了契约草案且成功落库时出现
 Contract  = { id, quadrant, symbol, mode, entry:{ price, qty, date },
               takeProfitPct, stopLossPct, maxHoldDays, locked:true,
               createdAt, overrides:[{ at, patch, reason }] }
 ```
+
+**成交流水联动契约（P5 事前承诺）**：`recordTrade` 可选 `contract` 参数（契约草案），
+与成交在**同一次 `save()`** 内落库（要么都成功、要么都不写）：
+- 该象限 + 标的**尚无契约** → 新建 `locked:true` 契约，`trade.contractId` 指向新契约；
+- 该象限 + 标的有**已存在契约** → 复用其 `id`（加仓不新建契约，`t/s/D` 保持锁定、不改历史），
+  写一条 `contract.reuse` 审计说明；
+- 草案的 `quadrant`/`symbol` 与成交不一致 → `ERR-CONTRACT-001`，整笔成交不落库。
+`positions()` 的 `contractId` 由同一份契约表推导（同象限同标的取最新一条），
+因此"成交 → 契约 → 持仓"三者的 id 严格自洽。
+契约的 `t/s/D` 只能来自 `stable.buildLockedContract`（内部调 `adaptiveTarget`）或显式 `addContract`；
+事后修改一律走 `overrideContract`（必须 reason，写审计）。
 
 ---
 
@@ -223,6 +236,15 @@ export function adaptiveTarget({ bars, config }): {
 export function checkPosition({ bars, contract, position }): {
   action:'hold'|'take_profit'|'stop_loss'|'time_exit',
   hitRule:string, detail:string, conditionOrders:object[] }
+/**
+ * 建仓契约草案（纯函数）：t/s/D 全部来自 adaptiveTarget，供 recordTrade({ contract }) 原子落库。
+ * entry 必须来自真实成交（price>0、qty 为正整数），否则抛 ERR-CONTRACT-001；
+ * 缺 symbol 抛 ERR-SYMBOL-001；bars 不足由 adaptiveTarget 抛 ERR-DATA-002（绝不编造 t/s）。
+ */
+export function buildLockedContract({ bars, symbol, entry, config, note }): {
+  quadrant:'stable', symbol, mode:'stable',
+  entry:{ price, qty, date }, takeProfitPct, stopLossPct, maxHoldDays,
+  source:'adaptiveTarget', note }
 ```
 
 ### 7.3 `shortTerm.js` 专有导出

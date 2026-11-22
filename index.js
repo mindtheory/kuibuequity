@@ -155,7 +155,7 @@ function apply(ctx, config) {
   ctx.tools.register(defineTool({
     name: 'kb_account',
     description:
-      '跬步量化·象限账本（long/stable/short 资金物理隔离）。action=status 三象限现金与持仓；init 建账（quadrant/cash/totalAsset）；trade 录入成交（symbol/side/price/qty，费用自动按插件费率算）；transfer 跨象限调拨（必须 reason，写审计）；contracts 查事前契约。',
+      '跬步量化·象限账本（long/stable/short 资金物理隔离）。action=status 三象限现金与持仓；init 建账（quadrant/cash/totalAsset）；trade 录入成交（symbol/side/price/qty，费用自动按插件费率算；stable 买入会自动生成并锁定止盈/止损/期限契约，t/s/D 取自 adaptiveTarget，与成交原子落库）；transfer 跨象限调拨（必须 reason，写审计）；contracts 查事前契约。',
     parameters: {
       action: { type: 'string', required: true, enum: ['status', 'init', 'trade', 'transfer', 'contracts'], description: '操作' },
       quadrant: { type: 'string', enum: ['long', 'stable', 'short'], description: '象限' },
@@ -165,6 +165,7 @@ function apply(ctx, config) {
       qty: { type: 'integer', description: '成交数量（股）' },
       fee: { type: 'number', description: '手续费（元）；留空按插件费率自动计算' },
       date: { type: 'string', description: '成交日期 YYYY-MM-DD，默认今天' },
+      days: { type: 'integer', description: 'trade：stable 买入生成契约时取用的日K根数，默认 250' },
       cash: { type: 'number', description: 'init：初始现金' },
       totalAsset: { type: 'number', description: 'init：象限总资产' },
       amount: { type: 'number', description: 'transfer：调拨金额（元）' },
@@ -192,8 +193,49 @@ function apply(ctx, config) {
             return { ok: false, code: 'ERR-INTERNAL', message: 'trade 需要 quadrant/symbol/side/price/qty' };
           }
           const autoFee = args.fee != null ? args.fee : tradeFee({ side, price, qty, fee });
-          const t = ledger.recordTrade({ quadrant, symbol, side, price, qty, fee: autoFee, date: args.date, note: args.reason || '' });
-          return { ok: true, trade: t };
+          // 稳定象限买入：自动生成锁定契约（t/s/D 来自 adaptiveTarget），与成交同一次 save()
+          let contractDraft = null;
+          let warning = null;
+          if (quadrant === 'stable' && side === 'buy') {
+            const strat = await tryImport('./src/strategies/index.js');
+            const stable = strat && strat.registry && strat.registry.stable;
+            if (stable && typeof stable.buildLockedContract === 'function') {
+              try {
+                const barsRes = await dailyBars(symbol, { days: args.days || 250, adjust, timeoutMs });
+                contractDraft = stable.buildLockedContract({
+                  bars: barsRes.bars,
+                  symbol,
+                  entry: { price, qty, date: args.date },
+                  config: {},
+                });
+              } catch (e) {
+                const err = toErr(e);
+                // P6 诚实的失败：拿不到波动率就不编造 t/s，成交照记但明确告知契约缺失
+                warning = {
+                  code: err.code,
+                  message: `行情/ATR 不可用，未能按 adaptiveTarget 锁定建仓契约（不编造 t/s）：${err.message}。成交已记账，恢复数据后请用 kb_stable action=contract 补建契约。`,
+                };
+              }
+            } else {
+              warning = { code: 'ERR-MODULE-001', message: '稳定策略模块不可用，未能生成建仓契约' };
+            }
+          }
+          const t = ledger.recordTrade({ quadrant, symbol, side, price, qty, fee: autoFee, date: args.date, note: args.reason || '', contract: contractDraft });
+          const persisted = t.contractId ? (ledger.contracts() || []).find((c) => c.id === t.contractId) || null : null;
+          const out = { ok: true, trade: t };
+          if (persisted) {
+            out.contract = {
+              id: persisted.id,
+              takeProfitPct: persisted.takeProfitPct,
+              stopLossPct: persisted.stopLossPct,
+              maxHoldDays: persisted.maxHoldDays,
+              entry: persisted.entry,
+              locked: persisted.locked,
+              source: persisted.source ?? null,
+            };
+          }
+          if (warning) out.warning = warning;
+          return out;
         }
         if (action === 'transfer') {
           if (!args.quadrant || !args.to || !(args.amount > 0) || !args.reason) {
@@ -280,8 +322,42 @@ function apply(ctx, config) {
         const barsRes = await dailyBars(args.symbol, { days: args.days || 250, adjust, timeoutMs });
         if (args.action === 'contract') {
           if (typeof stable.adaptiveTarget !== 'function') return moduleMissing('adaptiveTarget', './src/strategies/stable.js');
-          const t = stable.adaptiveTarget({ bars: barsRes.bars, config: args.targetPct ? { targetPct: args.targetPct / 100 } : {} });
-          return { ok: true, symbol: args.symbol, asOf: barsRes.asOf, contract: t, note: '契约建仓时锁定，修改需 override+reason（写审计）', footnotes: [DISCLAIMER] };
+          const cfg = args.targetPct ? { targetPct: args.targetPct / 100 } : {};
+          const t = stable.adaptiveTarget({ bars: barsRes.bars, config: cfg });
+          // 落库联动：已有 stable 持仓但尚无契约（如建仓时行情不可用）→ 此时补建并锁定
+          let persisted = null;
+          let alreadyLocked = null;
+          const ledgerMod = await tryImport('./src/ledger.js');
+          if (ledgerMod && typeof ledgerMod.makeLedger === 'function' && typeof stable.buildLockedContract === 'function') {
+            const ledger = ledgerMod.makeLedger(dataDir);
+            const pos = (ledger.positions('stable') || []).find((p) => p.symbol === args.symbol) || null;
+            const existing = pos?.contractId ? (ledger.contracts() || []).find((c) => c.id === pos.contractId) || null : null;
+            if (pos && !existing) {
+              persisted = ledger.addContract(
+                stable.buildLockedContract({
+                  bars: barsRes.bars,
+                  symbol: args.symbol,
+                  entry: { price: pos.avgPrice, qty: pos.qty, date: pos.openDate },
+                  config: cfg,
+                }),
+              );
+            } else if (existing) {
+              alreadyLocked = existing;
+            }
+          }
+          return {
+            ok: true,
+            symbol: args.symbol,
+            asOf: barsRes.asOf,
+            contract: persisted ?? alreadyLocked ?? t,
+            persisted: Boolean(persisted),
+            note: persisted
+              ? '已为既有持仓补建并锁定契约（t/s/D 来自 adaptiveTarget）；修改需 override+reason'
+              : alreadyLocked
+                ? '该持仓已有锁定契约，未重复创建；修改需 override+reason（写审计）'
+                : '参数预览：录入 stable 买入成交（kb_account action=trade）时会自动锁定契约',
+            footnotes: [DISCLAIMER],
+          };
         }
         if (args.action === 'check') {
           if (typeof stable.checkPosition !== 'function') return moduleMissing('checkPosition', './src/strategies/stable.js');

@@ -67,6 +67,18 @@ test('kb_account：init → trade → status 全链路（临时账本）', async
   assert.equal(status.ok, true);
   const pos = status.positions.find((p) => p.symbol === '600036');
   assert.ok(pos && pos.qty === 1000);
+  // stable 买入的契约联动：行情可用 → 自动锁定契约并关联持仓；不可用 → 诚实警告且不伪造 t/s
+  if (trade.warning) {
+    assert.equal(trade.warning.code, 'ERR-DATA-001', '数据不可用时必须明确报错码');
+    assert.equal(trade.contract, undefined, '不得凭空给出契约参数');
+    assert.equal(pos.contractId, null, '无契约时持仓 contractId 为 null');
+  } else {
+    assert.ok(trade.contract && trade.contract.locked === true, 'stable 买入必须自动锁定契约');
+    assert.ok(trade.contract.takeProfitPct >= 0.01 && trade.contract.takeProfitPct <= 0.05);
+    assert.equal(trade.contract.stopLossPct, -0.8 * trade.contract.takeProfitPct, 's = −0.8t');
+    assert.equal(trade.contract.id, trade.trade.contractId);
+    assert.equal(pos.contractId, trade.contract.id, '持仓必须关联该契约');
+  }
 });
 
 test('kb_account transfer：无 reason 拒绝（跨象限必须留痕）', async () => {
