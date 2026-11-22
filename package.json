@@ -1,0 +1,64 @@
+{
+  "name": "kuibuequity",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "跬步量化 — DSH plugin that helps ordinary people run a stock account with written rules instead of feelings: three quadrants (long-term dividend grid that drives cost to negative, stable 1–5% take-profit discipline, short-term ≤5-day forced exit). Read-only market data, simulated fills, human executes the orders.",
+  "license": "MIT",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "src/**",
+    "cordis.patch.yml",
+    "docs/**",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "test:unit": "node --test test/core.test.js test/risk.test.js test/strategies.test.js test/engine.test.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mindtheory/kuibuequity.git"
+  },
+  "homepage": "https://github.com/mindtheory/kuibuequity#readme",
+  "bugs": {
+    "url": "https://github.com/mindtheory/kuibuequity/issues"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "cordis",
+    "quant",
+    "quantitative-trading",
+    "a-share",
+    "stock",
+    "dividend",
+    "grid-trading",
+    "take-profit",
+    "risk-management",
+    "跬步量化"
+  ],
+  "author": "mindtheory",
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "^0.2.1-rc.2",
+    "@deepseek-ai/schemastery": "^3.18.5"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dsh": {
+    "engines": {
+      "dsh": ">=0.2.0"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

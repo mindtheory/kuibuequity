@@ -1,0 +1,34 @@
+# kuibuequity（跬步量化）bundle patch：挂载量化纪律插件。
+#
+# 内核是纯函数（指标/成本/回测/策略），网络只出现在行情层，
+# 不接任何券商接口 —— 插件只产出「指令单」，下单由人（或券商条件单）完成。
+#
+# 覆盖方式：在你自己 profile 的 cordis.patch.yml 里写同名 id 的条目即可覆盖
+# （profile patch 在 bundle patch 之后叠加）。
+#
+# 配置字段：
+#   dataDir            账本根目录；留空 = $DSH_HOME/kuibuequity（推荐）
+#   adjust             K 线复权口径：qfq（前复权，默认）| hfq | none
+#   httpTimeoutMs      行情请求超时（毫秒）
+#   commissionRate     佣金费率（默认万 2.5）
+#   commissionMin      单笔最低佣金（元）
+#   stampTaxRate       印花税（仅卖出）
+#   slippageBps        回测滑点（基点）
+#   quadrantSplit      三象限默认资金比例 long:stable:short（和为 1）
+#   allowLanState      允许非本机 GUI 客户端读取面板状态
+- insert:
+    - id: kuibuequity
+      name: 'kuibuequity'
+      config:
+        dataDir: ''
+        adjust: 'qfq'
+        httpTimeoutMs: 10000
+        commissionRate: 0.00025
+        commissionMin: 5
+        stampTaxRate: 0.0005
+        slippageBps: 0
+        quadrantSplit:
+          long: 0.6
+          stable: 0.3
+          short: 0.1
+        allowLanState: false
