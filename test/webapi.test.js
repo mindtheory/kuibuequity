@@ -49,6 +49,17 @@ async function call(pathname, { method = 'GET', body } = {}) {
 
 // register 的 mock 已直接收集路由
 
+/** fetch 打桩：断网降级用例不得依赖真实网络环境（能联网的机器上必须同样通过） */
+async function withOffline(fn) {
+  const original = globalThis.fetch;
+  globalThis.fetch = () => Promise.reject(new Error('offline (test stub)'));
+  try {
+    return await fn();
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
 test('webapi: 8 条路由全部注册', () => {
   for (const p of ['/api/kuibuequity/state', '/api/kuibuequity/quote', '/api/kuibuequity/sentiment', '/api/kuibuequity/plan', '/api/kuibuequity/init', '/api/kuibuequity/trade', '/api/kuibuequity/check', '/api/kuibuequity/review']) {
     assert.ok(routes.has(p), `缺少路由 ${p}`);
@@ -96,7 +107,7 @@ test('webapi: quote 缺 symbol → ERR-SYMBOL-001', async () => {
 });
 
 test('webapi: 联网路由断网优雅降级（ERR-DATA-001，不 500）', async () => {
-  const r = await call('/api/kuibuequity/sentiment');
+  const r = await withOffline(() => call('/api/kuibuequity/sentiment'));
   assert.equal(r.code, 200); // 错误走 200 + ok:false，UI 统一处理
   assert.equal(r.json.ok, false);
   assert.equal(r.json.code, 'ERR-DATA-001');

@@ -12,7 +12,7 @@ import path from 'node:path';
 import z from '@deepseek-ai/schemastery';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 
-import { quote, dailyBars, dividends, indexBars } from './src/market.js';
+import { quote, dailyBars, dividends, indexBars, listStocks, limitUpPool } from './src/market.js';
 import { RED_LINES, gate, expectancyCheck, sentimentGate, hardExitCheck } from './src/risk.js';
 import { resolveFee, tradeFee } from './src/costs.js';
 import { winRate, payoffRatio, maxDrawdown } from './src/indicators.js';
@@ -384,11 +384,12 @@ function apply(ctx, config) {
   ctx.tools.register(defineTool({
     name: 'kb_short',
     description:
-      '跬步量化·短线象限：情绪冰点总闸优先，个股打分其次，5 日强制离场不可 override。action=sentiment 情绪总闸状态；scan 候选池打分（收盘后跑）；exit 持仓离场提醒（含 5 日硬期限倒计时）。',
+      '跬步量化·短线象限：情绪冰点总闸优先，个股打分其次，5 日强制离场不可 override。action=sentiment 情绪总闸状态；scan 候选池打分（收盘后跑，symbols 留空则自动扫描全市场涨幅榜+涨停池，并剔除 ST/次新/低市值/低成交额/一字板）；exit 持仓离场提醒（含 5 日硬期限倒计时）。',
     parameters: {
       action: { type: 'string', required: true, enum: ['sentiment', 'scan', 'exit'], description: '操作' },
-      symbols: { type: 'string', description: 'scan：逗号分隔的候选代码；留空则只输出总闸状态' },
+      symbols: { type: 'string', description: 'scan：逗号分隔的候选代码（手工候选池）；留空则自动全市场扫描' },
       topN: { type: 'integer', description: 'scan：返回前 N 名，默认 10' },
+      pages: { type: 'integer', description: 'scan：自动扫描时抓取的涨幅榜页数（每页 100 只），默认 2' },
       symbol: { type: 'string', description: 'exit：持仓标的' },
     },
     output: TEXT_OUTPUT,
@@ -406,39 +407,92 @@ function apply(ctx, config) {
         const short = strat.registry.short;
         if (args.action === 'scan') {
           if (typeof short.scoreCandidates !== 'function') return moduleMissing('scoreCandidates', './src/strategies/shortTerm.js');
-          if (!args.symbols) return { ok: false, code: 'ERR-INTERNAL', message: 'scan 需要 symbols（逗号分隔候选池；本插件不自动拉全市场列表）' };
-          const list = String(args.symbols).split(/[,，\s]+/).filter(Boolean);
+          const topN = args.topN || 10;
+          const warnings = [];
           const candidates = [];
-          for (const s of list) {
+          let poolMeta = null;
+          let mode = 'manual';
+          if (args.symbols) {
+            // 手工候选池（兼容旧用法：用户自带自选/候选代码）
+            const list = String(args.symbols).split(/[,，\s]+/).filter(Boolean);
+            for (const s of list) {
+              try {
+                const q = await quote(s, { timeoutMs });
+                const barsRes = await dailyBars(s, { days: 60, adjust, timeoutMs });
+                const bars = barsRes.bars;
+                const last = bars[bars.length - 1] || {};
+                const closes = bars.map((b) => b.adjClose ?? b.close);
+                const vols = bars.map((b) => b.volume);
+                const volMa5 = vols.slice(-6, -1).reduce((a, b) => a + b, 0) / 5;
+                candidates.push({
+                  symbol: q.symbol, name: q.name,
+                  gainPct: q.changePct != null ? q.changePct / 100 : (closes.length > 1 ? closes.at(-1) / closes.at(-2) - 1 : 0),
+                  turnover: q.turnoverRate ?? 0,
+                  volumeRatio: volMa5 > 0 ? (q.volume ?? last.volume ?? 0) / volMa5 : 1,
+                  limitUp: q.limitUp != null && q.price >= q.limitUp - 1e-9,
+                  blown: false, firstLimitTime: null, boards: 1,
+                  floatCap: q.floatCap ?? 1e10, st: /ST/i.test(q.name || ''),
+                  oneWordBoard: false, sealAmount: 0, mainNetInflow: 0,
+                  amount: q.amount ?? last.amount ?? 0,
+                  amount20Avg: bars.slice(-20).reduce((a, b) => a + (b.amount || 0), 0) / Math.max(1, Math.min(20, bars.length)),
+                  listDays: bars.length, sectorLimitUps: 0,
+                });
+              } catch { /* 单票行情失败：跳过该票，不拖垮整池（P6：不伪造成交） */ }
+            }
+          } else {
+            // 全市场扫描：涨幅榜（clist）+ 涨停池（push2ex）→ 纯函数候选池过滤
+            if (typeof short.buildCandidatePool !== 'function') return moduleMissing('buildCandidatePool', './src/strategies/shortTerm.js');
+            const stocks = await listStocks({ sortDesc: true, pageSize: 100, maxPages: args.pages || 2, timeoutMs });
+            let zt = { rows: [] };
             try {
-              const q = await quote(s, { timeoutMs });
-              const barsRes = await dailyBars(s, { days: 60, adjust, timeoutMs });
-              const bars = barsRes.bars;
-              const last = bars[bars.length - 1] || {};
-              const closes = bars.map((b) => b.adjClose ?? b.close);
-              const vols = bars.map((b) => b.volume);
-              const volMa5 = vols.slice(-6, -1).reduce((a, b) => a + b, 0) / 5;
-              candidates.push({
-                symbol: q.symbol, name: q.name,
-                gainPct: q.changePct != null ? q.changePct / 100 : (closes.length > 1 ? closes.at(-1) / closes.at(-2) - 1 : 0),
-                turnover: q.turnoverRate ?? 0,
-                volumeRatio: volMa5 > 0 ? (q.volume ?? last.volume ?? 0) / volMa5 : 1,
-                limitUp: q.limitUp != null && q.price >= q.limitUp - 1e-9,
-                blown: false, firstLimitTime: null, boards: 1,
-                floatCap: q.floatCap ?? 1e10, st: /ST/i.test(q.name || ''),
-                oneWordBoard: false, sealAmount: 0, mainNetInflow: 0,
-                amount: q.amount ?? last.amount ?? 0,
-                amount20Avg: bars.slice(-20).reduce((a, b) => a + (b.amount || 0), 0) / Math.max(1, Math.min(20, bars.length)),
-                listDays: bars.length, sectorLimitUps: 0,
+              zt = await limitUpPool({ timeoutMs });
+              if (zt.note) warnings.push({ code: 'ERR-DATA-001', message: zt.note });
+            } catch (e) {
+              const err = toErr(e);
+              warnings.push({
+                code: err.code,
+                message: `涨停池不可用，候选池退化为仅涨幅榜（封单/连板/板块因子缺失，打分偏保守）：${err.message}`,
               });
-            } catch { /* 单票行情失败：跳过该票，不拖垮整池（P6：不伪造成交） */ }
+            }
+            const built = short.buildCandidatePool({ quotes: stocks.rows, limitUpRows: zt.rows, asOf: stocks.asOf, config: {} });
+            candidates.push(...built.candidates);
+            mode = 'full-market';
+            poolMeta = {
+              ...built.stats,
+              asOf: built.asOf,
+              listTotal: stocks.total,
+              pages: stocks.pages,
+              rejected: built.rejected.slice(0, 20),
+              rejectedTotal: built.rejected.length,
+              limitUpPoolRows: zt.rows.length,
+            };
+            if (stocks.rows.length < stocks.total) {
+              warnings.push({
+                code: 'ERR-DATA-002',
+                message: `列表仅抓取 ${stocks.rows.length}/${stocks.total} 只（分页上限 ${stocks.pages} 页），候选池只覆盖涨幅榜前列`,
+              });
+            }
           }
           const idx = await indexBars('000300', { days: 60, timeoutMs });
           const idxCloses = idx.bars.map((b) => b.adjClose ?? b.close);
           const ma5 = idxCloses.slice(-5).reduce((a, b) => a + b, 0) / Math.min(5, idxCloses.length);
           const market = { indexAboveMa5: idxCloses.at(-1) >= ma5, yesterdayLimitUpPremium: null, blowUpRate: null };
-          const ranked = short.scoreCandidates({ candidates, market, config: {}, topN: args.topN || 10 });
-          return { ok: true, sentimentOpen: ranked.open, sentimentReason: ranked.reason, candidates: ranked.candidates, asOf: idx.asOf, footnotes: [DISCLAIMER] };
+          const ranked = short.scoreCandidates({ candidates, market, config: {}, topN });
+          const out = {
+            ok: true,
+            mode,
+            sentimentOpen: ranked.open,
+            sentimentReason: ranked.reason,
+            candidates: ranked.candidates,
+            asOf: idx.asOf,
+            footnotes: [
+              '条件：情绪总闸优先；一字板买不到不计入候选；5 日强制离场不可 override。',
+              DISCLAIMER,
+            ],
+          };
+          if (poolMeta) out.pool = poolMeta;
+          if (warnings.length) out.warnings = warnings;
+          return out;
         }
         if (args.action === 'exit') {
           if (!args.symbol) return { ok: false, code: 'ERR-SYMBOL-001', message: 'exit 需要 symbol' };

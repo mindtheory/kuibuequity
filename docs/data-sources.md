@@ -496,19 +496,26 @@ Tushare 若接入，Token 必须由用户本地环境变量提供（`TUSHARE_TOK
 
 ---
 
-## 8. 实现状态对照（v0.1.0）
+## 8. 实现状态对照（v0.2.0-dev）
 
 | 能力 | 契约 | 状态 |
 | :-- | :-- | :-- |
-| `normalizeSymbol` | interface.md §3 | 计划 |
-| `quote()` | interface.md §3 | 计划（端点已实测） |
-| `dailyBars()` | interface.md §3 | 计划（端点待境内复测） |
-| `dividends()` | interface.md §3 | 计划（端点已实测，字段映射见 §1.4） |
-| `indexBars()` | interface.md §3 | 计划 |
-| 涨停池 / 炸板池 | 未列入 interface.md | **计划**（需先补契约，见下） |
-| 限频/重试/镜像降级 | interface.md §3 要求 | 计划 |
+| `normalizeSymbol` | interface.md §3 | ✅ 已实现 + 单测（test/market.test.js） |
+| `quote()` | interface.md §3 | ✅ 已实现（60s TTL 缓存；单测用 fetch 桩，不依赖外网） |
+| `dailyBars()` | interface.md §3 | ✅ 已实现（klt=101） |
+| `dividends()` | interface.md §3 | ✅ 已实现（字段映射见 §1.4） |
+| `indexBars()` | interface.md §3 | ✅ 已实现 |
+| `listStocks()`（clist 涨幅榜） | interface.md §3 | ✅ 已实现（分页 + 页间退避 + 去重） |
+| 涨停池 `limitUpPool()` | interface.md §3 | ✅ 已实现（封单/连板/炸板/行业） |
+| 炸板池 | 未列入 interface.md | **计划**（需先补契约） |
+| 短线候选池 `buildCandidatePool` | interface.md §7.3 | ✅ 已实现（纯函数：ST/次新/市值/成交额/一字板剔除） |
+| 限频/重试/镜像降级 | interface.md §3 要求 | 重试 ✅ / 页间退避 ✅ / 镜像降级待接 |
 | 交易日历 | 未定义 | **计划**（需新增契约条目） |
 
-> 契约缺口：涨停池/炸板池（短线打分必需）与交易日历（冷静期/熔断计数必需）
-> 尚未出现在 `interface.md` §3。**按"契约先行"原则，需先补 interface.md 再实现**，
-> 本文只做记录，不擅自定义字段名。
+> 契约缺口（仍待补）：交易日历（冷静期/熔断计数必需）、炸板池与昨日涨停溢价
+> （情绪总闸的 `yesterdayLimitUpPremium` / `blowUpRate` 两个输入）。
+> 按"契约先行"原则，需先补 `interface.md` 再实现，本文只做记录，不擅自定义字段名。
+>
+> 运行时注意：本机（境外出口）对 `push2ex.eastmoney.com` 间歇 TLS 中断、`push2` 亦偶发断开。
+> 所有联网函数按 P6 抛 `ERR-DATA-001`：`kb_short scan` 在列表不可达时直接失败；
+> 涨停池不可达时退化为「仅涨幅榜」并返回 `warnings`，绝不伪造封单/连板数据。

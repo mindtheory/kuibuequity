@@ -19,6 +19,14 @@ export const QUOTE_TTL_MS = 60000;
 export const quoteCache = new Map();
 
 const UT = 'fa5fd1943c7b386f172d6893dbfba10b';
+/** 涨停池接口的 ut（东财网页同源，免 Key） */
+const ZT_UT = '7eea3edcaed734bea9cbfc24409ed989';
+/** clist 板块筛选：深主板/深创/沪主板/科创/北交所 */
+export const CLIST_FS = 'm:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048';
+/** clist 默认字段（详见 docs/data-sources.md §1.6 与 parseClistRow） */
+export const CLIST_FIELDS = 'f2,f3,f5,f6,f8,f10,f12,f13,f14,f15,f16,f17,f18,f20,f21,f26,f62,f100';
+/** 分页页间退避（限频友好，docs/data-sources.md §3） */
+export const CLIST_PAGE_SLEEP_MS = 250;
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36';
 const DEFAULT_TIMEOUT_MS = 10000;
@@ -230,6 +238,122 @@ export function computeStale(asOf, now = new Date(), offsetMinutes = 480) {
   return String(asOf).slice(0, 10) < latestWeekdayString(now, offsetMinutes);
 }
 
+/** 北京时区今天 YYYYMMDD（涨停池 date 参数；market.js 允许读时钟） */
+export function todayCompactString(now = new Date(), offsetMinutes = 480) {
+  const shifted = new Date(now.getTime() + offsetMinutes * 60000);
+  return shifted.toISOString().slice(0, 10).replace(/-/g, '');
+}
+
+/** 百分数 → 小数（保留 6 位，避免 17.1433% → 0.1714 的二次舍入误差） */
+export function pctToDecimal(pct) {
+  if (pct == null || pct === '' || pct === '-') return null;
+  const n = Number(pct);
+  return Number.isFinite(n) ? Number((n / 100).toFixed(6)) : null;
+}
+
+/** 东财紧凑日期 'YYYYMMDD' → 'YYYY-MM-DD'；非法返回 null */
+export function compactDateToIso(v) {
+  const s = String(v ?? '').trim();
+  if (!/^\d{8}$/.test(s)) return null;
+  return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`;
+}
+
+/** 东财 'NNNNNN'（HHMMSS，可 5 位缺前导 0）→ 'HH:MM:SS'；空值/非法返回 null */
+export function compactTimeToHms(v) {
+  if (v == null || v === '' || v === '-') return null;
+  const s = String(v).trim().padStart(6, '0');
+  if (!/^\d{6}$/.test(s)) return null;
+  const hh = Number(s.slice(0, 2));
+  const mm = Number(s.slice(2, 4));
+  const ss = Number(s.slice(4, 6));
+  if (hh > 23 || mm > 59 || ss > 59) return null;
+  return `${s.slice(0, 2)}:${s.slice(2, 4)}:${s.slice(4, 6)}`;
+}
+
+/** 行情数值字段：'-' / '' / null → null（诚实空值，不补 0） */
+function numField(v) {
+  if (v == null || v === '' || v === '-') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** 代码 → 交易所（clist 只给 6 位代码，规则与 normalizeSymbol 一致） */
+function marketOfCode(code) {
+  if (/^6/.test(code)) return 'SH';
+  if (/^92/.test(code) || /^[48]/.test(code)) return 'BJ';
+  if (/^[03]/.test(code)) return 'SZ';
+  return null;
+}
+
+/**
+ * 纯函数：东财 clist 一行 → StockRow（interface.md §3）。
+ * clist 字段：f12代码 f14名称 f2最新价 f3涨跌幅% f5成交量(手) f6成交额 f8换手率%
+ *            f10量比 f15最高 f16最低 f17开盘 f18昨收 f20总市值 f21流通市值
+ *            f26上市日(YYYYMMDD) f62主力净流入
+ * 价格为 2 位小数；changePct 保持百分数（与 quote() 口径一致）；turnoverRate 转小数。
+ */
+export function parseClistRow(row = {}) {
+  const code = String(row.f12 ?? '').trim();
+  const market = marketOfCode(code);
+  if (!code || !market) throw new SymbolError(row.f12);
+  const name = row.f14 ? String(row.f14) : '';
+  const price = numField(row.f2);
+  const prevClose = numField(row.f18);
+  const volumeLots = numField(row.f5);
+  const lp = limitPrices({ code, market, name, prevClose });
+  return {
+    code,
+    name,
+    market,
+    price,
+    changePct: numField(row.f3), // 百分数
+    turnoverRate: pctToDecimal(numField(row.f8)), // 小数
+    volumeRatio: numField(row.f10),
+    open: numField(row.f17),
+    high: numField(row.f15),
+    low: numField(row.f16),
+    prevClose,
+    volume: volumeLots != null ? Math.round(volumeLots * 100) : null, // 手→股
+    amount: numField(row.f6),
+    floatCap: numField(row.f21),
+    totalCap: numField(row.f20),
+    listDate: compactDateToIso(row.f26),
+    mainNetInflow: numField(row.f62),
+    limitUpPrice: lp.limitUp,
+    limitUp: price != null && lp.limitUp != null ? price >= lp.limitUp - 1e-9 : false,
+    suspended: volumeLots == null || volumeLots === 0,
+  };
+}
+
+/**
+ * 纯函数：东财涨停池一行 → LimitUpRow（interface.md §3）。
+ * 字段：c代码 n名称 p价格×1000 zdp涨跌幅% amount成交额 ltsz流通市值 hs换手率%
+ *      lbc连板数 fbt/lbt首/末封板时间(HHMMSS) zbc炸板次数 fund封单额 hybk行业
+ */
+export function parseLimitUpRow(row = {}) {
+  const code = String(row.c ?? '').trim();
+  const market = marketOfCode(code);
+  if (!code || !market) throw new SymbolError(row.c);
+  const priceRaw = numField(row.p);
+  return {
+    code,
+    name: row.n ? String(row.n) : '',
+    market,
+    price: priceRaw != null ? round2(priceRaw / 1000) : null,
+    changePct: numField(row.zdp), // 百分数
+    amount: numField(row.amount),
+    floatCap: numField(row.ltsz),
+    turnoverRate: pctToDecimal(numField(row.hs)),
+    boards: numField(row.lbc),
+    firstLimitTime: compactTimeToHms(row.fbt),
+    lastLimitTime: compactTimeToHms(row.lbt),
+    blown: (numField(row.zbc) ?? 0) > 0,
+    sealAmount: numField(row.fund),
+    sector: row.hybk ? String(row.hybk) : null,
+  };
+}
+
+
 // ---------------------------------------------------------------------------
 // HTTP（fetch + AbortController + 指数退避重试）
 // ---------------------------------------------------------------------------
@@ -382,4 +506,114 @@ export async function indexBars(symbol = '000300', { days = 60, timeoutMs = DEFA
     secid: secid || undefined,
   });
   return res;
+}
+
+/**
+ * 全市场列表（东财 clist 免 Key）：短线候选池的唯一列表来源。
+ *
+ * 分页 + 页间退避 + 按 code 去重；total 取接口 data.total。
+ * 第一页结构异常 → ERR-DATA-001（绝不返回伪造候选池）；后续页失败保留已抓到的行（诚实部分结果）。
+ *
+ * @param {{fs?:string, fid?:string, sortDesc?:boolean, pageSize?:number, maxPages?:number,
+ *          pageSleepMs?:number, fields?:string, timeoutMs?:number}} opts
+ * @returns {Promise<{rows:object[], total:number, pages:number, asOf:string, source:string}>}
+ */
+export async function listStocks({
+  fs = CLIST_FS,
+  fid = 'f3',
+  sortDesc = true,
+  pageSize = 100,
+  maxPages = 2,
+  pageSleepMs = CLIST_PAGE_SLEEP_MS,
+  fields = CLIST_FIELDS,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+} = {}) {
+  const pz = Math.max(1, Math.min(200, Math.trunc(Number(pageSize) || 100)));
+  const pagesMax = Math.max(1, Math.min(10, Math.trunc(Number(maxPages) || 1)));
+  const gap = Math.max(0, Math.trunc(Number(pageSleepMs) || 0));
+  const rows = [];
+  const seen = new Set();
+  let total = null;
+  let pages = 0;
+  for (let pn = 1; pn <= pagesMax; pn++) {
+    if (pn > 1 && gap > 0) await sleep(gap);
+    const url =
+      'https://push2.eastmoney.com/api/qt/clist/get' +
+      `?pn=${pn}&pz=${pz}&po=${sortDesc ? 1 : 0}&np=1&fltt=2&invt=2&fid=${fid}&fs=${fs}&ut=${UT}&fields=${fields}`;
+    let json;
+    try {
+      json = await fetchJson(url, { timeoutMs });
+    } catch (e) {
+      if (pn === 1) throw e; // 第一页就失败：整体诚实失败
+      break; // 后续页失败：保留已抓到的行（调用方看 pages/total 判断是否完整）
+    }
+    const data = json && json.data;
+    const diff = data && data.diff;
+    if (!diff) {
+      if (pn === 1) throw new DataError('列表接口返回异常（无 data.diff），不伪造候选池');
+      break;
+    }
+    const raw = Array.isArray(diff) ? diff : Object.values(diff);
+    if (total == null) total = Number.isFinite(Number(data.total)) ? Number(data.total) : raw.length;
+    pages = pn;
+    let added = 0;
+    for (const r of raw) {
+      let row;
+      try {
+        row = parseClistRow(r);
+      } catch {
+        continue; // 单行代码异常：跳过该行（不污染整池）
+      }
+      if (seen.has(row.code)) continue;
+      seen.add(row.code);
+      rows.push(row);
+      added++;
+    }
+    if (raw.length < pz || rows.length >= total || added === 0) break;
+  }
+  return { rows, total: total ?? rows.length, pages, asOf: new Date().toISOString(), source: 'eastmoney:clist' };
+}
+
+/**
+ * 涨停池（东财 push2ex 免 Key）：封单强度 / 连板高度 / 涨停时间 / 板块效应来源。
+ * 非交易日或无数据 → rows: [] + note（不伪造）；HTTP 失败 → ERR-DATA-001。
+ *
+ * @param {{date?:string('YYYYMMDD'|'YYYY-MM-DD'), timeoutMs?:number}} opts
+ * @returns {Promise<{rows:object[], total:number, date:string, asOf:string, source:string, note?:string}>}
+ */
+export async function limitUpPool({ date, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+  const compact = String(date ?? '').trim().replace(/-/g, '') || todayCompactString();
+  if (!/^\d{8}$/.test(compact)) throw new DataError(`涨停池 date 非法（需 YYYYMMDD）: ${date}`);
+  const url =
+    'https://push2ex.eastmoney.com/getTopicZTPool' +
+    `?ut=${ZT_UT}&dpt=wz.ztzt&Pageindex=0&pagesize=200&sort=fbt:asc&date=${compact}`;
+  const json = await fetchJson(url, { timeoutMs });
+  const asOf = new Date().toISOString();
+  const data = json && json.data;
+  if (!data) {
+    return {
+      rows: [],
+      total: 0,
+      date: compact,
+      asOf,
+      source: 'eastmoney:push2ex',
+      note: '涨停池无数据（非交易日或当日接口未更新），不伪造涨停/封单数据',
+    };
+  }
+  const pool = Array.isArray(data.pool) ? data.pool : [];
+  const rows = [];
+  for (const r of pool) {
+    try {
+      rows.push(parseLimitUpRow(r));
+    } catch {
+      /* 单行异常跳过 */
+    }
+  }
+  return {
+    rows,
+    total: Number.isFinite(Number(data.tc)) ? Number(data.tc) : rows.length,
+    date: String(data.qdate || compact),
+    asOf,
+    source: 'eastmoney:push2ex',
+  };
 }

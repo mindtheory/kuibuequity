@@ -6,6 +6,20 @@
 
 ### Added
 
+- **短线候选池全市场扫描**：`kb_short action=scan` 的 `symbols` 留空即自动扫描全市场——
+  `src/market.js` 新增 `listStocks()`（东财 clist 涨幅榜，免 Key；分页 ≤`maxPages`、
+  页间退避 `pageSleepMs`、按代码去重）与 `limitUpPool()`（东财 push2ex 涨停池：封单/连板/
+  涨停时间/炸板/行业），配套纯函数 `parseClistRow()` / `parseLimitUpRow()`
+- **候选池纯函数** `src/strategies/shortTerm.js#buildCandidatePool`：纳入（涨停/涨幅≥5%/
+  换手≥5%/量比≥2）与剔除（停牌、ST、次新<60 自然日、流通市值<30 亿、成交额<1 亿、一字板）
+  全部无网络/无时钟；上市日/市值/成交额缺失时保守剔除并写明原因，不用默认值冒充真数据；
+  涨停池富化连板高度、封单额、炸板、同行业涨停家数
+- **测试** `test/short-pool.test.js` 15 例：字段映射、分页去重、第一页结构异常 ERR-DATA-001、
+  后续页失败保留部分结果、涨停池无数据不伪造、四条纳入、九条剔除、涨停池富化、
+  `kb_short scan` 端到端（全市场 / 涨停池降级 warning / 列表不可达 ERR-DATA-001 / 手工候选池）
+- 文档：`docs/interface.md` §3 新增 `listStocks`/`limitUpPool`/`parseClistRow`/`parseLimitUpRow`
+  与 StockRow/LimitUpRow 契约，§7.3 新增 `buildCandidatePool`；`docs/data-sources.md` §8
+  实现状态对齐（并记录境外出口 TLS 间歇中断的降级口径）
 - **Web GUI 面板（M5）**：`client.js` 浏览器半区——DSH 侧栏「跬步量化」入口 + 主区三象限驾驶舱
   （总览/持仓/指令单/个股体检/复盘 五 Tab；情绪总闸灯、成本转负进度条、条件单 CSV 导出、象限建账入口）
 - **面板 API** `src/webapi.js`：`/api/kuibuequity/{state,init,trade,quote,sentiment,plan,check,review}`
@@ -24,12 +38,26 @@
 
 ### Changed（契约变更，`docs/interface.md` 已同步）
 
+- `kb_short` 新增 `pages` 参数（自动扫描抓取页数，默认 2）；`scan` 返回新增 `mode`
+  （`full-market`|`manual`）、`pool`（候选池统计/剔除明细前 20 条/涨停池行数）、`warnings`
+  （涨停池降级、列表未覆盖全市场等）。`symbols` 语义改为"手工候选池"，留空即自动扫描，
+  不再报"本插件不自动拉全市场列表"。
+- 短线扫描的诚实降级：涨幅榜不可达 → 直接 `ERR-DATA-001`（不伪造候选池）；涨停池不可达 →
+  退化为仅涨幅榜并返回 `warnings`，封单/连板因子缺数据时不得补非零值（打分因此偏保守）。
 - `ledger.recordTrade` 新增可选参数 `contract`（契约草案），返回值 `Trade` 可含 `contractId`；
   草案 `quadrant/symbol` 与成交不一致 → `ERR-CONTRACT-001`，整笔不落库。
 - `stable.buildLockedContract({ bars, symbol, entry, config })` 纳入接口契约（§7.2）；
   entry 必须来自真实成交，bars 不足仍由 `adaptiveTarget` 抛 `ERR-DATA-002`（P6 不编造 t/s）。
 - `kb_account`/`kb_stable` 工具描述与 `days` 参数同步；行情不可用时 `kb_account trade` 照常记账，
   但返回 `warning: ERR-DATA-001` 且不生成契约（诚实失败，不伪造止盈止损）。
+
+### Fixed
+
+- 联网降级用例不再依赖"运行环境恰好断网"：`test/plugin.test.js`、`test/webapi.test.js`
+  统一用 `globalThis.fetch` 打桩（断网 → 拒绝 / 日K → 固定桩），
+  `kb_account` 的 stable 契约断言改为手算对齐（TR=0.2 → t=4%、s=−3.2%）；
+  原 `s === −0.8t` 在 t 舍入到 4 位后必然不精确相等，联网环境下会误报。
+  测试套件因此在联网/断网机器上都可复现同一结果。
 
 ## [0.1.0] - 2026-11-22
 

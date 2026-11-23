@@ -17,6 +17,7 @@ export const meta = {
   configSchema: {
     minGainPct: { default: 0.05 },
     minTurnover: { default: 0.05 },
+    minVolRatio: { default: 2 },
     minAmount: { default: 100000000 }, // 日均成交额 ≥1 亿
     minFloatCap: { default: 3000000000 }, // 流通市值 ≥30 亿
     minListDays: { default: 60 },
@@ -93,9 +94,109 @@ function timeScore(t) {
   return 2; // 尾盘板
 }
 
+/** 两个 YYYY-MM-DD 的自然日差（asOf - date）；非法返回 null */
+function daysBetween(date, asOf) {
+  const t1 = Date.parse(`${String(date).slice(0, 10)}T00:00:00Z`);
+  const t2 = Date.parse(`${String(asOf).slice(0, 10)}T00:00:00Z`);
+  if (!Number.isFinite(t1) || !Number.isFinite(t2)) return null;
+  return Math.round((t2 - t1) / 86400000);
+}
+
+/**
+ * 短线候选池构建（纯函数，无网络/时钟；docs/interface.md §7.3）
+ *
+ * 纳入：涨停 / 涨幅 ≥ minGainPct / 换手 ≥ minTurnover / 量比 ≥ minVolRatio
+ * 剔除：停牌、ST/*ST、次新（上市自然日 < minListDays）、流通市值不足、成交额不足、一字板（买不到）
+ * 上市日/流通市值/成交额缺失 → 保守剔除并写明原因（P6 不猜）。
+ * quotes 来自 market.parseClistRow；limitUpRows 来自 market.parseLimitUpRow（可空，
+ * 缺省时封单/连板/板块因子缺数据，不得凭空补非零值）。
+ */
+export function buildCandidatePool({ quotes = [], limitUpRows = [], asOf, config = {} } = {}) {
+  const cfg = { ...defaults, ...config };
+  const refDate = String(asOf || '').slice(0, 10) || null;
+  const ztByCode = new Map();
+  const sectorCount = new Map();
+  for (const r of limitUpRows || []) {
+    if (!r || !r.code || ztByCode.has(r.code)) continue;
+    ztByCode.set(r.code, r);
+    if (r.sector) sectorCount.set(r.sector, (sectorCount.get(r.sector) || 0) + 1);
+  }
+  const candidates = [];
+  const rejected = [];
+  const seen = new Set();
+  const reject = (q, name, rule, reason) => rejected.push({ symbol: q.code, name, rule, reason });
+
+  for (const q of quotes || []) {
+    if (!q || !q.code || seen.has(q.code)) continue;
+    seen.add(q.code);
+    const zt = ztByCode.get(q.code) || null;
+    const name = q.name || zt?.name || '';
+    const price = q.price ?? zt?.price ?? null;
+    const limitUp = q.limitUp === true || !!zt;
+    const gainPct = q.changePct != null ? q.changePct / 100 : zt?.changePct != null ? zt.changePct / 100 : null;
+    const turnover = q.turnoverRate ?? zt?.turnoverRate ?? null;
+    const volumeRatio = q.volumeRatio ?? null;
+    const floatCap = q.floatCap ?? zt?.floatCap ?? null;
+    const amount = q.amount ?? zt?.amount ?? null;
+    const listDays = refDate && q.listDate ? daysBetween(q.listDate, refDate) : null;
+    const st = /ST/i.test(name);
+    const oneWordBoard =
+      limitUp &&
+      q.limitUpPrice != null &&
+      [q.open, q.high, q.low, price].every((v) => v != null && Math.abs(Number(v) - Number(q.limitUpPrice)) < 1e-9);
+
+    // 硬性剔除（顺序固定，便于测试与复盘对齐）
+    if (q.suspended) { reject(q, name, 'SUSPENDED', '停牌或零成交，无法成交'); continue; }
+    if (st) { reject(q, name, 'ST', 'ST/*ST 不参与短线'); continue; }
+    if (q.listDate == null) { reject(q, name, 'LIST_DATE_MISSING', '上市日缺失，无法判定次新（保守剔除）'); continue; }
+    if (listDays != null && listDays < cfg.minListDays) { reject(q, name, 'NEW_LISTING', `上市 ${listDays} 自然日 < ${cfg.minListDays}，次新剔除`); continue; }
+    if (floatCap == null) { reject(q, name, 'FLOAT_CAP_MISSING', '流通市值缺失（保守剔除）'); continue; }
+    if (floatCap < cfg.minFloatCap) { reject(q, name, 'FLOAT_CAP', `流通市值 ${(floatCap / 1e8).toFixed(1)} 亿 < ${(cfg.minFloatCap / 1e8).toFixed(0)} 亿`); continue; }
+    if (amount == null) { reject(q, name, 'AMOUNT_MISSING', '成交额缺失（保守剔除）'); continue; }
+    if (amount < cfg.minAmount) { reject(q, name, 'AMOUNT', `成交额 ${(amount / 1e8).toFixed(2)} 亿 < ${(cfg.minAmount / 1e8).toFixed(0)} 亿`); continue; }
+    if (oneWordBoard) { reject(q, name, 'ONE_WORD', '一字涨停买不到，剔除（P6 不伪造成交）'); continue; }
+    const included =
+      limitUp ||
+      (gainPct != null && gainPct >= cfg.minGainPct) ||
+      (turnover != null && turnover >= cfg.minTurnover) ||
+      (volumeRatio != null && volumeRatio >= cfg.minVolRatio);
+    if (!included) {
+      reject(q, name, 'NOT_STRONG', '未触发涨停/涨幅/换手/量比任一纳入条件');
+      continue;
+    }
+    candidates.push({
+      symbol: q.code,
+      name,
+      gainPct,
+      turnover,
+      volumeRatio,
+      limitUp,
+      blown: zt ? zt.blown === true : false,
+      firstLimitTime: zt?.firstLimitTime ?? null,
+      boards: zt?.boards ?? (limitUp ? 1 : 0),
+      floatCap,
+      amount20Avg: amount, // clist 无 20 日均额：当日成交额作代理，已在 note 标注
+      listDays,
+      st,
+      oneWordBoard,
+      sealAmount: zt?.sealAmount,
+      mainNetInflow: q.mainNetInflow,
+      amount,
+      sector: zt?.sector ?? null,
+      sectorLimitUps: zt?.sector ? sectorCount.get(zt.sector) || 0 : 0,
+      note: 'amount20Avg 为当日成交额代理（clist 无 20 日均额）',
+    });
+  }
+  return {
+    asOf: refDate,
+    candidates,
+    rejected,
+    stats: { quotes: seen.size, included: candidates.length, rejected: rejected.length },
+  };
+}
+
 /** 候选池打分入口（收盘后跑） */
-export function scoreCandidates({ candidates = [], market = {}, config = {}, topN = 10 }) {
-  const gate = sentimentGate(market);
+export function scoreCandidates({ candidates = [], market = {}, config = {}, topN = 10 }) {  const gate = sentimentGate(market);
   if (!gate.open) {
     return { open: false, reason: gate.reason, candidates: [], note: '情绪总闸关闭：今日短线空仓，不输出任何买入指令' };
   }

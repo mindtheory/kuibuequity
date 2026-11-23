@@ -103,6 +103,51 @@ export async function dividends(symbol, { timeoutMs = 10000 } = {})
 
 /** 指数收盘序列（大盘过滤用），默认 000300 沪深300 */
 export async function indexBars(symbol = '000300', { days = 60 } = {}): Promise<{ bars: Bar[], asOf }>
+
+/**
+ * 全市场列表（涨幅榜/换手榜，东财 clist 免 Key）——短线候选池的唯一列表来源。
+ * 分页抓取：每页间隔 pageSleepMs（默认 250ms，限频友好），最多 maxPages 页，按 code 去重。
+ * 结构异常 / 第一页无 data.diff → ERR-DATA-001（不伪造候选池）；后续页异常则保留已抓到的行。
+ */
+export async function listStocks({ fs, fid = 'f3', sortDesc = true, pageSize = 100,
+                                  maxPages = 2, pageSleepMs = 250,
+                                  timeoutMs } = {})
+  : Promise<{ rows: StockRow[], total, pages, asOf, source }>
+StockRow = {
+  code, name, market:'SH'|'SZ'|'BJ',
+  price, changePct,        // 价格元；changePct 百分数（与 quote() 口径一致）
+  turnoverRate,            // 小数（f8=0.68% → 0.0068）
+  volumeRatio, open, high, low, prevClose,
+  volume,                  // 股
+  amount, floatCap, totalCap,
+  listDate,                // 'YYYY-MM-DD'（f26 上市日），未知 null
+  mainNetInflow,           // 主力净流入（元，f62）
+  limitUpPrice,            // 由 prevClose + 板块/ST 涨跌幅规则算出的涨停价
+  limitUp,                 // price >= limitUpPrice
+  suspended,               // 零成交近似
+}
+
+/**
+ * 涨停池（东财 push2ex，免 Key）：短线打分卡的封单强度/连板高度/涨停时间/板块效应来源。
+ * 非交易日或无数据 → rows: [] 且带 note（不伪造）；HTTP 失败 → ERR-DATA-001。
+ * @param {{date?:string('YYYYMMDD'), timeoutMs?:number}} opts
+ */
+export async function limitUpPool({ date, timeoutMs } = {})
+  : Promise<{ rows: LimitUpRow[], total, date, asOf, source, note? }>
+LimitUpRow = {
+  code, name, price, changePct,        // price 元；changePct 百分数
+  amount, floatCap, turnoverRate,      // 换手率小数
+  boards,                              // 连板数 lbc
+  firstLimitTime, lastLimitTime,       // 'HH:MM:SS'
+  blown,                               // zbc > 0
+  sealAmount,                          // 封单额（元）fund
+  sector,                              // 所属行业 hybk
+}
+
+/** 纯函数：clist 原始行 → StockRow（'-' → null；量 手→股；换手 % → 小数） */
+export function parseClistRow(row): StockRow
+/** 纯函数：涨停池原始行 → LimitUpRow（p/1000；fbt/lbt HHMMSS → 'HH:MM:SS'） */
+export function parseLimitUpRow(row): LimitUpRow
 ```
 
 实现要求：
@@ -253,6 +298,24 @@ export function scoreCandidates({ quotes, barsMap, indexBars, config }): Array<{
   symbol, name, score, factors:object, reasons:string[], tradable:boolean, note:string }>
 export function exitPlan({ position, bars, contract }): {
   action, mustExit:boolean, deadline:string, reason:string }
+/**
+ * 短线候选池构建（纯函数，无网络/时钟）：涨幅榜/换手/量比纳入，ST/次新/流通市值/成交额/停牌/一字板剔除。
+ * quotes 来自 market.parseClistRow；limitUpRows 来自 market.parseLimitUpRow（可为空——此时封单/连板因子
+ * 缺失，打分偏保守，不得凭空补 0 以外的值）。
+ * @param {{quotes:object[], limitUpRows?:object[], asOf:string, config?:object}} p
+ * @returns {{ asOf, candidates: Candidate[], rejected: [{symbol,name,rule,reason}], stats }}
+ * Candidate = scoreOne 的输入字段（symbol,name,gainPct,turnover,volumeRatio,limitUp,blown,
+ *             firstLimitTime,boards,floatCap,amount20Avg,listDays,st,oneWordBoard,sealAmount,
+ *             mainNetInflow,amount,sectorLimitUps）
+ * 纳入：limitUp 或 gainPct >= minGainPct(0.05) 或 turnover >= minTurnover(0.05) 或 volumeRatio >= minVolRatio(2)
+ * 剔除：ST/*ST、上市自然日 < minListDays(60)、floatCap < minFloatCap(3e9)、
+ *       amount < minAmount(1e8)、suspended、一字板（open=high=low=price=涨停价，买不到）
+ *      上市日/流通市值/成交额缺失 → 保守剔除（LIST_DATE_MISSING/FLOAT_CAP_MISSING/AMOUNT_MISSING），
+ *      不得用默认值冒充真实数据。
+ * 口径说明：clist 无「20 日均成交额」，以当日成交额作代理（amount20Avg=amount），
+ *           已在候选 note 标注，不冒充均额。
+ */
+export function buildCandidatePool({ quotes, limitUpRows, asOf, config }): object
 ```
 
 ---

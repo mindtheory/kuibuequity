@@ -34,6 +34,35 @@ mod.apply(makeMockCtx(), { dataDir, httpTimeoutMs: 4000 });
 /** defineTool().execute 直接返回业务对象（render 才转文本） */
 const call = (name, args) => registered.get(name).execute(args);
 
+/**
+ * fetch 打桩：让「断网降级」用例与真实网络环境解耦（CI/办公网/境外出口都可稳定复现）。
+ * 不打桩的断网断言会在能联网的机器上失败 —— 那不是产品 bug，是测试依赖环境，属于禁止项。
+ */
+async function withFetch(impl, fn) {
+  const original = globalThis.fetch;
+  globalThis.fetch = impl;
+  try {
+    return await fn();
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
+/** 恒定波动的日K桩：TR = max(0.2, 0.1, 0.1) = 0.2 → ATR%=0.02 → t=4% / s=-3.2% */
+function stableKlinePayload(n = 60) {
+  const lines = [];
+  const base = Date.UTC(2026, 5, 1);
+  for (let i = 0; i < n; i++) {
+    const d = new Date(base + i * 86400000).toISOString().slice(0, 10);
+    lines.push(`${d},10.00,10.00,10.10,9.90,100000,100000000,2.00,0.00,0.00,1.00`);
+  }
+  return { rc: 0, data: { code: '600036', name: '招商银行', klines: lines } };
+}
+
+async function withOffline(fn) {
+  return withFetch(() => Promise.reject(new Error('offline (test stub)')), fn);
+}
+
 const TOOL_NAMES = ['kb_market', 'kb_account', 'kb_longterm', 'kb_stable', 'kb_short', 'kb_backtest', 'kb_risk', 'kb_review'];
 
 test('apply: 注册全部 8 个 kb_* 工具 + systemPrompt 纪律段', () => {
@@ -57,28 +86,27 @@ test('kb_risk check：超单票上限被闸门挡下', async () => {
   assert.equal(r.gate.code, 'ERR-RISK-003');
 });
 
-test('kb_account：init → trade → status 全链路（临时账本）', async () => {
+test('kb_account：init → trade → status 全链路（临时账本，日K打桩）', async () => {
   const init = await call('kb_account', { action: 'init', quadrant: 'stable', cash: 100000, totalAsset: 100000 });
   assert.equal(init.ok, true);
-  const trade = await call('kb_account', { action: 'trade', quadrant: 'stable', symbol: '600036', side: 'buy', price: 10, qty: 1000, date: '2026-11-20' });
+  const trade = await withFetch(
+    () => ({ ok: true, status: 200, json: async () => stableKlinePayload() }),
+    () => call('kb_account', { action: 'trade', quadrant: 'stable', symbol: '600036', side: 'buy', price: 10, qty: 1000, date: '2026-11-20' }),
+  );
   assert.equal(trade.ok, true);
   assert.ok(trade.trade.fee > 0, '费用应自动按费率计算');
   const status = await call('kb_account', { action: 'status' });
   assert.equal(status.ok, true);
   const pos = status.positions.find((p) => p.symbol === '600036');
   assert.ok(pos && pos.qty === 1000);
-  // stable 买入的契约联动：行情可用 → 自动锁定契约并关联持仓；不可用 → 诚实警告且不伪造 t/s
-  if (trade.warning) {
-    assert.equal(trade.warning.code, 'ERR-DATA-001', '数据不可用时必须明确报错码');
-    assert.equal(trade.contract, undefined, '不得凭空给出契约参数');
-    assert.equal(pos.contractId, null, '无契约时持仓 contractId 为 null');
-  } else {
-    assert.ok(trade.contract && trade.contract.locked === true, 'stable 买入必须自动锁定契约');
-    assert.ok(trade.contract.takeProfitPct >= 0.01 && trade.contract.takeProfitPct <= 0.05);
-    assert.equal(trade.contract.stopLossPct, -0.8 * trade.contract.takeProfitPct, 's = −0.8t');
-    assert.equal(trade.contract.id, trade.trade.contractId);
-    assert.equal(pos.contractId, trade.contract.id, '持仓必须关联该契约');
-  }
+  // 行情打桩（TR=0.2 → ATR%=0.02）：t = 2×0.02 = 4%，s = −0.8t = −3.2%（手算对齐）
+  assert.ok(trade.contract, 'stable 买入必须自动锁定契约');
+  assert.equal(trade.contract.locked, true);
+  assert.equal(trade.contract.takeProfitPct, 0.04);
+  assert.equal(trade.contract.stopLossPct, -0.032);
+  assert.ok(Math.abs(trade.contract.takeProfitPct * 0.8 + trade.contract.stopLossPct) < 1e-9, 's = −0.8t');
+  assert.equal(trade.contract.id, trade.trade.contractId);
+  assert.equal(pos.contractId, trade.contract.id, '持仓必须关联该契约');
 });
 
 test('kb_account transfer：无 reason 拒绝（跨象限必须留痕）', async () => {
@@ -94,13 +122,13 @@ test('kb_review：空账本复盘不崩', async () => {
 });
 
 test('kb_market：断网时优雅返回 ERR-DATA-001（不抛异常、不伪造数据）', async () => {
-  const r = await call('kb_market', { action: 'bars', symbol: '601398', days: 5 });
+  const r = await withOffline(() => call('kb_market', { action: 'bars', symbol: '601398', days: 5 }));
   assert.equal(r.ok, false);
   assert.equal(r.code, 'ERR-DATA-001');
 });
 
 test('kb_longterm：断网时优雅返回 ERR-DATA-001', async () => {
-  const r = await call('kb_longterm', { action: 'grid', symbol: '601398' });
+  const r = await withOffline(() => call('kb_longterm', { action: 'grid', symbol: '601398' }));
   assert.equal(r.ok, false);
   assert.equal(r.code, 'ERR-DATA-001');
 });
@@ -112,13 +140,13 @@ test('kb_stable expectancy：样本不足返回 INSUFFICIENT_SAMPLE', async () =
 });
 
 test('kb_short sentiment：断网时优雅返回 ERR-DATA-001', async () => {
-  const r = await call('kb_short', { action: 'sentiment' });
+  const r = await withOffline(() => call('kb_short', { action: 'sentiment' }));
   assert.equal(r.ok, false);
   assert.equal(r.code, 'ERR-DATA-001');
 });
 
 test('kb_backtest：断网时优雅返回 ERR-DATA-001', async () => {
-  const r = await call('kb_backtest', { mode: 'stable', symbol: '601398', days: 60 });
+  const r = await withOffline(() => call('kb_backtest', { mode: 'stable', symbol: '601398', days: 60 }));
   assert.equal(r.ok, false);
   assert.equal(r.code, 'ERR-DATA-001');
 });
