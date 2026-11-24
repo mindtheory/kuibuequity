@@ -25,8 +25,9 @@
   `buildCandidatePool` 按 §6.2 纳入与剔除（ST/次新/流通市值/成交额/停牌/一字板，缺失字段保守剔除）；
   列表不可达 → ERR-DATA-001，涨停池不可达 → 降级仅涨幅榜 + warnings。
   （2026-11-23 完成，commit 8dd19ce；15 例新测试，全量 143 测试全绿）
-- [ ] **备选数据源适配器**：Tushare（需 Token，env `KUIBU_TUSHARE_TOKEN`）作为 dailyBars/dividends 的
+- [~] **备选数据源适配器**：Tushare（需 Token，env `KUIBU_TUSHARE_TOKEN`）作为 dailyBars/dividends 的
   备源；market.js 增加 source 链（eastmoney → tushare），输出标注实际 source。无 Token 时静默跳过备源。
+  （本轮进行中：接口契约已补至 interface.md §3.1）
 - [ ] **条件单导出 CSV**：`toConditionOrders` 基础上加 `kb_stable action=export`，输出券商条件单
   导入格式 CSV（触发价/委托价/数量/有效期），UTF-8 BOM，Excel 可直接打开。
 

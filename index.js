@@ -115,7 +115,7 @@ function apply(ctx, config) {
   ctx.tools.register(defineTool({
     name: 'kb_market',
     description:
-      '跬步量化·行情层（东方财富免 Key，只读）。action=quote 实时快照（含涨跌停价/停牌/陈旧标记）；bars 日K（默认前复权 250 根）；dividends 分红送配历史；index 指数收盘序列（默认沪深300）。所有输出带 asOf 与 stale 标记。',
+      '跬步量化·行情层（东财免 Key 主源，Tushare 可选备源）。action=quote 实时快照（含涨跌停价/停牌/陈旧标记）；bars 日K（默认前复权 250 根）；dividends 分红送配历史；index 指数收盘序列（默认沪深300）。所有输出带 asOf、stale 与实际 source；日K/分红在东财不可达时可用 env KUIBU_TUSHARE_TOKEN 走 Tushare 备源，无 Token 则如实报 ERR-DATA-001。',
     parameters: {
       action: { type: 'string', required: true, enum: ['quote', 'bars', 'dividends', 'index'], description: '操作' },
       symbol: { type: 'string', description: '证券代码：600036 / sh600036 / 600036.SH；action=index 时默认 000300' },

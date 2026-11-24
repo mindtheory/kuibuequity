@@ -33,6 +33,21 @@ const DEFAULT_TIMEOUT_MS = 10000;
 /** 失败重试 ≤3 次，指数退避 */
 const RETRY_DELAYS_MS = [200, 400, 800];
 
+// ---- 备选数据源（Tushare Pro）：docs/interface.md §3.1 ----
+/** 备源 Token 环境变量（只从环境读取，绝不写入代码/账本/错误消息） */
+export const TUSHARE_TOKEN_ENV = 'KUIBU_TUSHARE_TOKEN';
+/** 历史文档里出现过的变量名，作为兼容回退 */
+export const TUSHARE_TOKEN_ENV_LEGACY = 'TUSHARE_TOKEN';
+/** 默认数据源链：东财主源 → Tushare 备源 */
+export const DEFAULT_SOURCE_CHAIN = ['eastmoney', 'tushare'];
+/** 契约内允许的源名（未知源名 → ERR-DATA-001，不静默跳过） */
+export const SOURCE_NAMES = ['eastmoney', 'tushare'];
+const TUSHARE_URL = 'https://api.tushare.pro';
+const TUSHARE_DAILY_FIELDS = 'ts_code,trade_date,open,high,low,close,pre_close,pct_chg,vol,amount';
+const TUSHARE_ADJ_FIELDS = 'ts_code,trade_date,adj_factor';
+const TUSHARE_DIVIDEND_FIELDS =
+  'ts_code,end_date,div_proc,cash_div,cash_div_tax,stk_bo_rate,stk_co_rate,ex_date,record_date,pay_date';
+
 /** 常见指数 secid 映射（指数代码与个股代码空间重叠，如 000300/000001，必须显式映射） */
 export const INDEX_SECIDS = {
   '000001': '1.000001', // 上证指数
@@ -355,6 +370,209 @@ export function parseLimitUpRow(row = {}) {
 
 
 // ---------------------------------------------------------------------------
+// Tushare 备源纯函数（不联网、不读时钟：日期窗由 tushareDateRange 显式传入 now）
+// ---------------------------------------------------------------------------
+
+/** Tushare 日期（'YYYYMMDD' 或 'YYYY-MM-DD'）→ 'YYYY-MM-DD'；非法返回 null */
+function tsIsoDate(v) {
+  const s = String(v ?? '').trim();
+  if (/^\d{8}$/.test(s)) return compactDateToIso(s);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  return null;
+}
+
+/** 数值字段：null/''/非数 → null（诚实空值，不补 0） */
+function tsNum(v) {
+  if (v == null || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * 纯函数：Token 解析。opts 显式值优先，其次 env.KUIBU_TUSHARE_TOKEN，
+ * 再回退 env.TUSHARE_TOKEN；空白/null → null（调用方据此静默跳过备源）。
+ * 只读入参，不读文件、不写日志、不回显。
+ */
+export function resolveTushareToken(optsToken, env = process.env) {
+  const pick = (v) => {
+    if (v == null) return null;
+    const s = String(v).trim();
+    return s === '' ? null : s;
+  };
+  return (
+    pick(optsToken) ??
+    pick(env ? env[TUSHARE_TOKEN_ENV] : null) ??
+    pick(env ? env[TUSHARE_TOKEN_ENV_LEGACY] : null) ??
+    null
+  );
+}
+
+/**
+ * 纯函数：Tushare 返回的 `data:{fields, items}` → 对象数组。
+ * 结构异常（缺 fields/items、行长与 fields 不符）→ ERR-DATA-001：不猜字段、不补位。
+ */
+export function tushareRows(data) {
+  if (!data || !Array.isArray(data.fields) || !Array.isArray(data.items)) {
+    throw new DataError('Tushare 返回结构异常（缺 data.fields / data.items），不伪造数据');
+  }
+  const rows = [];
+  for (const item of data.items) {
+    if (!Array.isArray(item) || item.length !== data.fields.length) {
+      throw new DataError('Tushare 行长度与 fields 不一致，不猜测字段');
+    }
+    const row = {};
+    data.fields.forEach((f, i) => {
+      row[f] = item[i];
+    });
+    rows.push(row);
+  }
+  return rows;
+}
+
+/**
+ * 纯函数：Tushare `daily` 行 → 未复权中间结构。
+ * vol 单位「手」→ 股 ×100；amount 单位「千元」→ 元 ×1000；trade_date 归一为 'YYYY-MM-DD'。
+ * 关键字段缺失/非法 → ERR-DATA-001（不把空值当 0）。
+ */
+export function parseTushareDailyRow(row = {}) {
+  const date = tsIsoDate(row.trade_date);
+  if (!date) throw new DataError(`Tushare 日线行日期非法: ${JSON.stringify(row.trade_date)}`);
+  const open = tsNum(row.open);
+  const high = tsNum(row.high);
+  const low = tsNum(row.low);
+  const close = tsNum(row.close);
+  const volLots = tsNum(row.vol);
+  const amountK = tsNum(row.amount);
+  if (![open, high, low, close, volLots, amountK].every((n) => n != null)) {
+    throw new DataError(`Tushare 日线行数值缺失: ${date}`);
+  }
+  return {
+    date,
+    open,
+    high,
+    low,
+    close,
+    preClose: tsNum(row.pre_close),
+    volume: Math.round(volLots * 100), // 手 → 股
+    amount: amountK * 1000, // 千元 → 元
+    changePct: tsNum(row.pct_chg),
+  };
+}
+
+/**
+ * 纯函数：Tushare `daily` 行 + `adj_factor` 行 → Bar[]（interface.md §3）。
+ * 复权公式（与 tushare pro_bar 口径一致）：
+ *   qfq: price × factor ÷ 窗口内最新 factor；hfq: price × factor；none: 原价。
+ * 任一交易日缺复权因子 → ERR-DATA-001（绝不把未复权价冒充复权价）。
+ * 复权价 round4（A 股报价 0.01，4 位足够且便于手算回归）。
+ * limitUp/limitDown 用前一交易日（复权后）收盘 + limitPrices 派生；suspended = 零成交。
+ */
+export function barsFromTushare(dailyRows = [], adjRows = [], { code = '', market = '', name = '', adjust = 'qfq' } = {}) {
+  const adj = adjust === 'hfq' ? 'hfq' : adjust === 'none' ? 'none' : 'qfq';
+  const parsed = (dailyRows || [])
+    .map(parseTushareDailyRow)
+    .sort((a, b) => a.date.localeCompare(b.date));
+  if (parsed.length === 0) return [];
+  const factorByDate = new Map();
+  for (const r of adjRows || []) {
+    const d = tsIsoDate(r.trade_date);
+    const f = tsNum(r.adj_factor);
+    if (d && f != null && f > 0) factorByDate.set(d, f);
+  }
+  let lastFactor = null;
+  if (adj !== 'none') {
+    const dates = [...factorByDate.keys()].sort();
+    if (dates.length === 0) throw new DataError(`Tushare 复权因子为空，拒绝把未复权价冒充${adj === 'hfq' ? '后' : '前'}复权价`);
+    lastFactor = factorByDate.get(dates[dates.length - 1]);
+  }
+  const bars = [];
+  for (let i = 0; i < parsed.length; i++) {
+    const p = parsed[i];
+    let scale = 1;
+    if (adj !== 'none') {
+      const f = factorByDate.get(p.date);
+      if (f == null || f <= 0) {
+        throw new DataError(`Tushare 缺 ${p.date} 复权因子，拒绝冒充复权价`);
+      }
+      scale = adj === 'hfq' ? f : f / lastFactor;
+    }
+    const adjPrice = (v) => round4(v * scale);
+    const close = adjPrice(p.close);
+    const bar = {
+      date: p.date,
+      open: adjPrice(p.open),
+      high: adjPrice(p.high),
+      low: adjPrice(p.low),
+      close,
+      volume: p.volume,
+      amount: p.amount,
+      adjClose: close,
+      limitUp: false,
+      limitDown: false,
+      suspended: p.volume === 0,
+      dividendPerShare: 0,
+    };
+    const prevClose = i > 0 ? bars[i - 1].close : null;
+    if (prevClose > 0) {
+      const lp = limitPrices({ code, market, name, prevClose });
+      if (lp.limitUp != null) {
+        bar.limitUp = bar.high >= lp.limitUp - 1e-9 && bar.close >= lp.limitUp - 1e-9;
+        bar.limitDown = bar.low <= lp.limitDown + 1e-9 && bar.close <= lp.limitDown + 1e-9;
+      }
+    }
+    bars.push(bar);
+  }
+  return bars;
+}
+
+/**
+ * 纯函数：Tushare `dividend` 行 → 契约项（interface.md §3）。
+ * 只取 div_proc==='实施' 且 ex_date 可解析；cashPerShare 用税前 `cash_div_tax`（元/股）；
+ * bonusShares←stk_bo_rate、capitalizeShares←stk_co_rate（均为每股）。非实施/无日期 → null。
+ */
+export function parseTushareDividendRow(row = {}) {
+  if (String(row.div_proc ?? '').trim() !== '实施') return null;
+  const exDate = tsIsoDate(row.ex_date);
+  if (!exDate) return null;
+  return {
+    exDate,
+    cashPerShare: round4(tsNum(row.cash_div_tax) ?? 0),
+    bonusShares: round4(tsNum(row.stk_bo_rate) ?? 0),
+    capitalizeShares: round4(tsNum(row.stk_co_rate) ?? 0),
+  };
+}
+
+/**
+ * 纯函数：Tushare 请求日期窗。
+ * end = 北京时区今天；start = 回看 max(120, days×2+30) 自然日（上限 4000），覆盖停牌与长假。
+ */
+export function tushareDateRange(days, now = new Date()) {
+  const n = Math.max(1, Math.min(2000, Math.trunc(Number(days) || 250)));
+  const lookback = Math.min(4000, Math.max(120, n * 2 + 30));
+  const endDate = todayCompactString(now);
+  const base = Date.UTC(Number(endDate.slice(0, 4)), Number(endDate.slice(4, 6)) - 1, Number(endDate.slice(6, 8)));
+  const startDate = new Date(base - lookback * 86400000).toISOString().slice(0, 10).replace(/-/g, '');
+  return { startDate, endDate };
+}
+
+/** 解析数据源链：默认 ['eastmoney','tushare']，去重保序；未知源/空数组 → ERR-DATA-001 */
+function normalizeSourceChain(sources) {
+  if (sources == null) return [...DEFAULT_SOURCE_CHAIN];
+  if (!Array.isArray(sources) || sources.length === 0) {
+    throw new DataError('sources 必须是非空数组（如 [\'eastmoney\',\'tushare\']）');
+  }
+  const chain = [];
+  for (const raw of sources) {
+    const name = String(raw ?? '').trim().toLowerCase();
+    if (!SOURCE_NAMES.includes(name)) {
+      throw new DataError(`未知数据源: ${JSON.stringify(raw)}（支持 ${SOURCE_NAMES.join(' / ')}）`);
+    }
+    if (!chain.includes(name)) chain.push(name);
+  }
+  return chain;
+}
+
+// ---------------------------------------------------------------------------
 // HTTP（fetch + AbortController + 指数退避重试）
 // ---------------------------------------------------------------------------
 
@@ -362,17 +580,24 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function fetchJson(url, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+async function fetchJson(
+  url,
+  { timeoutMs = DEFAULT_TIMEOUT_MS, method = 'GET', body = null, headers = null,
+    retryDelaysMs = RETRY_DELAYS_MS } = {},
+) {
+  const delays = Array.isArray(retryDelaysMs) ? retryDelaysMs : RETRY_DELAYS_MS;
   let lastErr = null;
-  for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
-    if (attempt > 0) await sleep(RETRY_DELAYS_MS[attempt - 1]);
+  for (let attempt = 0; attempt <= delays.length; attempt++) {
+    if (attempt > 0) await sleep(delays[attempt - 1]);
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
-      const res = await fetch(url, {
-        signal: ctrl.signal,
-        headers: { 'user-agent': UA, referer: 'https://quote.eastmoney.com/' },
-      });
+      const hdrs = { 'user-agent': UA };
+      if (body == null) hdrs.referer = 'https://quote.eastmoney.com/'; // 东财同源，Tushare POST 不需要
+      Object.assign(hdrs, headers || {});
+      const init = { signal: ctrl.signal, headers: hdrs, method };
+      if (body != null) init.body = typeof body === 'string' ? body : JSON.stringify(body);
+      const res = await fetch(url, init);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -382,7 +607,7 @@ async function fetchJson(url, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
     }
   }
   const host = String(url).split('?')[0];
-  throw new DataError(`行情源不可达 ${host}（重试 ${RETRY_DELAYS_MS.length} 次）: ${lastErr ? lastErr.message : 'unknown'}`);
+  throw new DataError(`行情源不可达 ${host}（重试 ${delays.length} 次）: ${lastErr ? lastErr.message : 'unknown'}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -432,13 +657,62 @@ export async function quote(symbol, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
 }
 
 /**
- * 日K线（默认前复权）。
- * 注意：push2his 的 klt=101 才是日线（102 为周线），任务书里的 klt=102 是笔误，
- * 这里按契约「日K」实现为 klt=101。
+ * 数据源链执行器（interface.md §3.1）：按顺序尝试，命中即返回并留痕；
+ * 未配置 Token 的 Tushare 静默跳过（skipped='NO_TOKEN'）；全部失败 → ERR-DATA-001 汇总原因。
  */
-export async function dailyBars(
+async function runSourceChain({ chain, token, label, tasks, opts = {} }) {
+  const attempts = [];
+  for (const name of chain) {
+    if (name === 'tushare' && !token) {
+      attempts.push({ source: 'tushare', ok: false, skipped: 'NO_TOKEN' });
+      continue;
+    }
+    try {
+      const res = await tasks[name]({ ...opts, token });
+      attempts.push({ source: name, ok: true });
+      return { ...res, sourceChain: chain, attempts };
+    } catch (e) {
+      attempts.push({
+        source: name,
+        ok: false,
+        code: (e && e.code) || 'ERR-DATA-001',
+        message: e && e.message ? String(e.message) : String(e),
+      });
+    }
+  }
+  const detail = attempts
+    .map((a) =>
+      a.skipped === 'NO_TOKEN'
+        ? `${a.source}: 跳过（未配置 Token，env ${TUSHARE_TOKEN_ENV}）`
+        : `${a.source}: ${a.message}`,
+    )
+    .join(' | ');
+  throw new DataError(`${label} 全部数据源失败 —— ${detail}`);
+}
+
+/** Tushare Pro POST 调用：Token 只进请求体，绝不进 URL/错误消息 */
+async function tushareCall(apiName, params, { token, fields, timeoutMs = DEFAULT_TIMEOUT_MS, retryDelaysMs } = {}) {
+  if (!token) throw new DataError(`Tushare 未配置 Token（env ${TUSHARE_TOKEN_ENV}），跳过备源`);
+  const json = await fetchJson(TUSHARE_URL, {
+    method: 'POST',
+    body: { api_name: apiName, token, params, fields },
+    headers: { 'content-type': 'application/json' },
+    timeoutMs,
+    retryDelaysMs,
+  });
+  if (!json || typeof json !== 'object') {
+    throw new DataError(`Tushare ${apiName} 返回非对象（不猜数据）`);
+  }
+  if (Number(json.code) !== 0) {
+    throw new DataError(`Tushare ${apiName} 失败 code=${json.code}: ${String(json.msg ?? '').slice(0, 200)}`);
+  }
+  return json.data;
+}
+
+/** 东财日K（主源）。push2his 的 klt=101 才是日线（102 为周线）。 */
+async function dailyBarsFromEastmoney(
   symbol,
-  { days = 250, adjust = 'qfq', timeoutMs = DEFAULT_TIMEOUT_MS, secid: secidOverride = null, name = '' } = {},
+  { days = 250, adjust = 'qfq', timeoutMs = DEFAULT_TIMEOUT_MS, secid: secidOverride = null, name = '', retryDelaysMs } = {},
 ) {
   const { code, market, secid } = normalizeSymbol(symbol);
   const fqt = adjust === 'hfq' ? 2 : adjust === 'none' ? 0 : 1; // qfq=1 hfq=2 none=0
@@ -448,7 +722,7 @@ export async function dailyBars(
     '&fields1=f1,f2,f3,f4,f5,f6' +
     '&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61' +
     `&klt=101&fqt=${fqt}&end=20500101&lmt=${lmt}`;
-  const json = await fetchJson(url, { timeoutMs });
+  const json = await fetchJson(url, { timeoutMs, retryDelaysMs });
   const data = json && json.data;
   if (!data || !Array.isArray(data.klines) || data.klines.length === 0) {
     throw new DataError(`无K线数据: ${code}（可能代码错误或停牌过久）`);
@@ -462,18 +736,101 @@ export async function dailyBars(
     asOf,
     stale: computeStale(asOf),
     source: 'eastmoney:push2his',
+    warnings: [],
     count: bars.length,
   };
 }
 
-/** 分红送配历史（用于股息率与摊薄模拟） */
-export async function dividends(symbol, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+/** Tushare 备源日K：daily + adj_factor（qfq/hfq 必须取到因子，否则诚实失败） */
+async function dailyBarsFromTushare(
+  symbol,
+  { days = 250, adjust = 'qfq', name = '', token, timeoutMs = DEFAULT_TIMEOUT_MS, retryDelaysMs } = {},
+) {
+  const { code, market } = normalizeSymbol(symbol);
+  const tsCode = `${code}.${market}`;
+  const lmt = Math.max(1, Math.min(2000, Math.trunc(Number(days) || 250)));
+  const range = tushareDateRange(lmt);
+  const dailyData = await tushareCall(
+    'daily',
+    { ts_code: tsCode, start_date: range.startDate, end_date: range.endDate },
+    { token, fields: TUSHARE_DAILY_FIELDS, timeoutMs, retryDelaysMs },
+  );
+  const dailyRows = tushareRows(dailyData);
+  if (dailyRows.length === 0) throw new DataError(`Tushare 无日线数据: ${tsCode}`);
+  let adjRows = [];
+  if (adjust !== 'none') {
+    const adjData = await tushareCall(
+      'adj_factor',
+      { ts_code: tsCode, start_date: range.startDate, end_date: range.endDate },
+      { token, fields: TUSHARE_ADJ_FIELDS, timeoutMs, retryDelaysMs },
+    );
+    adjRows = tushareRows(adjData);
+    if (adjRows.length === 0) {
+      throw new DataError(`Tushare 复权因子为空: ${tsCode}（拒绝把未复权价冒充复权价）`);
+    }
+  }
+  dailyRows.sort((a, b) => String(a.trade_date).localeCompare(String(b.trade_date)));
+  const sliced = dailyRows.slice(-lmt);
+  const bars = barsFromTushare(sliced, adjRows, { code, market, name, adjust });
+  if (bars.length === 0) throw new DataError(`Tushare 日线窗口无有效数据: ${tsCode}`);
+  const warnings = [];
+  if (!name) {
+    warnings.push('Tushare 源不提供证券名称，涨跌停判定按非 ST 规则（若为 ST 标的可能偏差）');
+  }
+  const asOf = bars[bars.length - 1].date;
+  return {
+    symbol: code,
+    bars,
+    adjust,
+    asOf,
+    stale: computeStale(asOf),
+    source: 'tushare:daily',
+    warnings,
+    count: bars.length,
+  };
+}
+
+/**
+ * 日K线（默认前复权）——数据源链：东财主源 → Tushare 备源（需 env KUIBU_TUSHARE_TOKEN）。
+ * 返回的 source 是实际生效源，attempts 逐源留痕；全部失败 → ERR-DATA-001（不返回半截/未复权冒充）。
+ * @param {{days?:number, adjust?:'qfq'|'hfq'|'none', timeoutMs?:number,
+ *          sources?:string[], tushareToken?:string, retryDelaysMs?:number[],
+ *          secid?:string, name?:string}} [options]
+ */
+export async function dailyBars(symbol, options = {}) {
+  const {
+    days = 250,
+    adjust = 'qfq',
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    sources,
+    tushareToken,
+    retryDelaysMs = RETRY_DELAYS_MS,
+    secid = null,
+    name = '',
+  } = options;
+  const chain = normalizeSourceChain(sources);
+  const token = resolveTushareToken(tushareToken);
+  const adj = adjust === 'hfq' ? 'hfq' : adjust === 'none' ? 'none' : 'qfq';
+  return runSourceChain({
+    chain,
+    token,
+    label: `日K ${String(symbol)}`,
+    opts: { days, adjust: adj, timeoutMs, retryDelaysMs, secid, name },
+    tasks: {
+      eastmoney: (o) => dailyBarsFromEastmoney(symbol, o),
+      tushare: (o) => dailyBarsFromTushare(symbol, o),
+    },
+  });
+}
+
+/** 东财分红送配（主源） */
+async function dividendsFromEastmoney(symbol, { timeoutMs = DEFAULT_TIMEOUT_MS, retryDelaysMs } = {}) {
   const { code } = normalizeSymbol(symbol);
   const url =
     'https://datacenter-web.eastmoney.com/api/data/v1/get' +
     `?reportName=RPT_SHAREBONUS_DET&columns=ALL&filter=(SECURITY_CODE%3D%22${code}%22)` +
     '&sortColumns=EX_DIVIDEND_DATE&sortTypes=-1&pageSize=50&pageNumber=1&source=WEB&client=WEB';
-  const json = await fetchJson(url, { timeoutMs });
+  const json = await fetchJson(url, { timeoutMs, retryDelaysMs });
   const rows = json && json.result && json.result.data;
   if (!Array.isArray(rows)) {
     throw new DataError(`分红接口返回结构与预期不符: ${code}（不硬编造，请人工核对接口）`);
@@ -488,11 +845,51 @@ export async function dividends(symbol, { timeoutMs = DEFAULT_TIMEOUT_MS } = {})
       capitalizeShares: r.IT_RATIO != null ? round4(Number(r.IT_RATIO) / 10) : 0,
     }))
     .filter((it) => it.exDate);
-  return { symbol: code, items, source: 'eastmoney:datacenter' };
+  return { symbol: code, items, source: 'eastmoney:datacenter', warnings: [], count: items.length };
 }
 
-/** 指数收盘序列（大盘过滤用），默认 000300 沪深300（secid=1.000300） */
-export async function indexBars(symbol = '000300', { days = 60, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+/** Tushare 备源分红：仅实施中的方案，按 exDate 降序 */
+async function dividendsFromTushare(symbol, { token, timeoutMs = DEFAULT_TIMEOUT_MS, retryDelaysMs } = {}) {
+  const { code, market } = normalizeSymbol(symbol);
+  const data = await tushareCall('dividend', { ts_code: `${code}.${market}` }, {
+    token,
+    fields: TUSHARE_DIVIDEND_FIELDS,
+    timeoutMs,
+    retryDelaysMs,
+  });
+  const rows = tushareRows(data);
+  const items = rows
+    .map(parseTushareDividendRow)
+    .filter(Boolean)
+    .sort((a, b) => b.exDate.localeCompare(a.exDate));
+  return { symbol: code, items, source: 'tushare:dividend', warnings: [], count: items.length };
+}
+
+/**
+ * 分红送配历史（数据源链同 dailyBars）。
+ * @param {{timeoutMs?:number, sources?:string[], tushareToken?:string, retryDelaysMs?:number[]}} [options]
+ */
+export async function dividends(symbol, options = {}) {
+  const { timeoutMs = DEFAULT_TIMEOUT_MS, sources, tushareToken, retryDelaysMs = RETRY_DELAYS_MS } = options;
+  const chain = normalizeSourceChain(sources);
+  const token = resolveTushareToken(tushareToken);
+  return runSourceChain({
+    chain,
+    token,
+    label: `分红送配 ${String(symbol)}`,
+    opts: { timeoutMs, retryDelaysMs },
+    tasks: {
+      eastmoney: (o) => dividendsFromEastmoney(symbol, o),
+      tushare: (o) => dividendsFromTushare(symbol, o),
+    },
+  });
+}
+
+/**
+ * 指数收盘序列（大盘过滤用），默认 000300 沪深300（secid=1.000300）。
+ * 指数数据只走东财：Tushare 指数需 `index_daily`，未纳入 §3.1 契约（不因备源缺失而失败）。
+ */
+export async function indexBars(symbol = '000300', { days = 60, timeoutMs = DEFAULT_TIMEOUT_MS, retryDelaysMs } = {}) {
   const bare = String(symbol)
     .trim()
     .toUpperCase()
@@ -503,6 +900,8 @@ export async function indexBars(symbol = '000300', { days = 60, timeoutMs = DEFA
     days,
     adjust: 'none', // 指数不复权
     timeoutMs,
+    retryDelaysMs,
+    sources: ['eastmoney'],
     secid: secid || undefined,
   });
   return res;

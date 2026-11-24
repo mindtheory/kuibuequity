@@ -491,8 +491,10 @@ stale = (asOf 的日期 < lastTradingDay)
 | 限频 | 未公开（保守 2 QPS） | 未公开（同源） | 明确按积分（如 500 次/分钟） |
 | 本项目定位 | **主源** | **离线研究/对账**（不进运行时） | **可选对账源**（用户自带 Token，本地配置） |
 
-**结论**：运行时只用东方财富（零依赖原则）；AkShare 仅作为**研究脚本**在仓库外做交叉校验；
-Tushare 若接入，Token 必须由用户本地环境变量提供（`TUSHARE_TOKEN`），**不得写入代码或账本**。
+**结论**：运行时主源仍只用东方财富（零依赖原则）；AkShare 仅作为**研究脚本**在仓库外做交叉校验；
+Tushare 已作为 `dailyBars`/`dividends` 的**可选备源**接入源链（`eastmoney → tushare`，见 `interface.md` §3.1）。
+Token 由用户本地环境变量提供（`KUIBU_TUSHARE_TOKEN`，兼容旧名 `TUSHARE_TOKEN`），
+只用于请求体，**不得写入代码或账本、不进日志与错误消息**；未配置 Token 时备源静默跳过，不影响主源。
 
 ---
 
@@ -502,9 +504,12 @@ Tushare 若接入，Token 必须由用户本地环境变量提供（`TUSHARE_TOK
 | :-- | :-- | :-- |
 | `normalizeSymbol` | interface.md §3 | ✅ 已实现 + 单测（test/market.test.js） |
 | `quote()` | interface.md §3 | ✅ 已实现（60s TTL 缓存；单测用 fetch 桩，不依赖外网） |
-| `dailyBars()` | interface.md §3 | ✅ 已实现（klt=101） |
-| `dividends()` | interface.md §3 | ✅ 已实现（字段映射见 §1.4） |
-| `indexBars()` | interface.md §3 | ✅ 已实现 |
+| `dailyBars()` | interface.md §3 | ✅ 已实现（klt=101；源链见下行） |
+| `dividends()` | interface.md §3 | ✅ 已实现（字段映射见 §1.4；源链见下行） |
+| Tushare 备源（daily + adj_factor） | interface.md §3.1 | ✅ 已实现（qfq=price×f÷最新f / hfq=price×f / none；缺因子即 ERR-DATA-001） |
+| Tushare 备源（dividend） | interface.md §3.1 | ✅ 已实现（仅「实施」方案，税前 cash_div_tax，按 exDate 降序） |
+| 数据源链 `sources` + `attempts` | interface.md §3.1 | ✅ 已实现（默认 eastmoney→tushare；无 Token 静默跳过；未知源 ERR-DATA-001） |
+| `indexBars()` | interface.md §3 | ✅ 已实现（只走东财：Tushare 指数需 `index_daily`，未纳入契约） |
 | `listStocks()`（clist 涨幅榜） | interface.md §3 | ✅ 已实现（分页 + 页间退避 + 去重） |
 | 涨停池 `limitUpPool()` | interface.md §3 | ✅ 已实现（封单/连板/炸板/行业） |
 | 炸板池 | 未列入 interface.md | **计划**（需先补契约） |

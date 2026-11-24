@@ -6,6 +6,24 @@
 
 ### Added
 
+- **备选数据源适配器（Tushare 备源 + 数据源链）**：`src/market.js` 的 `dailyBars()`/`dividends()`
+  改为按 `sources` 顺序尝试，默认 `['eastmoney','tushare']`；产出的 `source` 为**实际生效源**，
+  另返回 `sourceChain`、`attempts`（逐源留痕：`ok` / `skipped:'NO_TOKEN'` / `code` / `message`）与
+  `warnings`。Tushare 走 `https://api.tushare.pro` POST：日K用 `daily` + `adj_factor`
+  （qfq=price×f÷窗口最新f、hfq=price×f、none=原价；任一交易日缺因子即 ERR-DATA-001，
+  绝不把未复权价冒充复权价），分红用 `dividend`（仅 `div_proc==='实施'`，税前 `cash_div_tax`，
+  `stk_bo_rate`/`stk_co_rate` 映射送股/转增，按 `exDate` 降序）
+- **纯函数** `tushareRows` / `parseTushareDailyRow` / `barsFromTushare` / `parseTushareDividendRow` /
+  `resolveTushareToken` / `tushareDateRange`（无网络、无时钟，日期窗由显式 `now` 传入）；
+  Token 解析优先级：入参 > env `KUIBU_TUSHARE_TOKEN` > 兼容 `TUSHARE_TOKEN`，空白即视为未配置
+- **测试** `test/data-source-chain.test.js` 20 例：手算对齐前复权（10.00×2.0/2.2=9.0909、
+  11.00×2.2/2.2=11）、hfq/none 口径、vol 手→股/amount 千元→元、复权因子缺失拒绝冒充、
+  仅「实施」入契约、日期窗边界、东财不可达→Tushare 接替、无 Token 静默跳过且不联网、
+  未知源名拒绝、全源失败 ERR-DATA-001 汇总且不回显 Token、`sources:['tushare']` 不触东财、
+  东财成功不触发备源、`indexBars` 只走东财
+- 文档：`docs/interface.md` §3 签名/返回字段 + 新增 §3.1 数据源链契约与备源纯函数；
+  `docs/data-sources.md` §7/§8 同步实现状态；`docs/design.md` §9 数据层补源链说明
+
 - **短线候选池全市场扫描**：`kb_short action=scan` 的 `symbols` 留空即自动扫描全市场——
   `src/market.js` 新增 `listStocks()`（东财 clist 涨幅榜，免 Key；分页 ≤`maxPages`、
   页间退避 `pageSleepMs`、按代码去重）与 `limitUpPool()`（东财 push2ex 涨停池：封单/连板/
@@ -38,6 +56,11 @@
 
 ### Changed（契约变更，`docs/interface.md` 已同步）
 
+- `dailyBars()`/`dividends()` 新增可选参数 `sources`（默认 `['eastmoney','tushare']`）、
+  `tushareToken`、`retryDelaysMs`；返回值新增 `sourceChain`/`attempts`/`warnings`（`dividends` 另加 `count`）。
+  未知源名或空链 → `ERR-DATA-001`（拼写错误不得静默跳过）；全部源失败 → 汇总各源原因后 `ERR-DATA-001`，
+  不返回半截或未复权冒充数据；无 Token 时 Tushare 静默跳过（`attempts` 记 `skipped:'NO_TOKEN'`）。
+  `indexBars()` 明确只走东财（Tushare 指数需 `index_daily`，未纳入契约）。
 - `kb_short` 新增 `pages` 参数（自动扫描抓取页数，默认 2）；`scan` 返回新增 `mode`
   （`full-market`|`manual`）、`pool`（候选池统计/剔除明细前 20 条/涨停池行数）、`warnings`
   （涨停池降级、列表未覆盖全市场等）。`symbols` 语义改为"手工候选池"，留空即自动扫描，

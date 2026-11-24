@@ -396,7 +396,9 @@ T+1 卖出规则下最早次日可卖：
 
 ## 9. 数据层
 
-首选**东方财富免 Key 公开接口**（国内直连、无需注册），备选 AkShare/Tushare（需 Token）。
+首选**东方财富免 Key 公开接口**（国内直连、无需注册），备选 AkShare/Tushare（Tushare 需 Token）。
+Tushare 已作为 `dailyBars`/`dividends` 的可选备源接入源链（`eastmoney → tushare`，
+Token 只从 env `KUIBU_TUSHARE_TOKEN` 读取，无 Token 静默跳过），口径见 `docs/interface.md` §3.1。
 详细端点、字段映射、限频与降级策略见 `docs/data-sources.md`。
 
 数据质量硬要求（否则回测失真）：

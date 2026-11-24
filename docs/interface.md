@@ -91,15 +91,19 @@ export async function quote(symbol, { timeoutMs = 8000 } = {}): Promise<Quote>
 Quote = { symbol, name, price, open, high, low, prevClose, changePct, volume, amount,
           turnoverRate, limitUp, limitDown, suspended, asOf, stale:boolean, source }
 
-/** 日 K（默认前复权） */
-export async function dailyBars(symbol, { days = 250, adjust = 'qfq', timeoutMs = 10000 } = {})
-   : Promise<{ symbol, bars: Bar[], adjust, asOf, stale, source, count }>
+/** 日 K（默认前复权）——带数据源链，见 §3.1 */
+export async function dailyBars(symbol, { days = 250, adjust = 'qfq', timeoutMs = 10000,
+                                          sources = ['eastmoney','tushare'], tushareToken,
+                                          retryDelaysMs } = {})
+   : Promise<{ symbol, bars: Bar[], adjust, asOf, stale, source, sourceChain, attempts,
+               warnings: string[], count }>
 Bar = { date, open, high, low, close, volume, amount, adjClose,
         limitUp:boolean, limitDown:boolean, suspended:boolean, dividendPerShare:number }
 
-/** 分红送配历史（用于股息率与摊薄模拟） */
-export async function dividends(symbol, { timeoutMs = 10000 } = {})
-   : Promise<{ symbol, items: [{ exDate, cashPerShare, bonusShares, capitalizeShares }], source }>
+/** 分红送配历史（用于股息率与摊薄模拟）——同样走数据源链 */
+export async function dividends(symbol, { timeoutMs = 10000, sources, tushareToken, retryDelaysMs } = {})
+   : Promise<{ symbol, items: [{ exDate, cashPerShare, bonusShares, capitalizeShares }],
+               source, sourceChain, attempts, warnings: string[], count }>
 
 /** 指数收盘序列（大盘过滤用），默认 000300 沪深300 */
 export async function indexBars(symbol = '000300', { days = 60 } = {}): Promise<{ bars: Bar[], asOf }>
@@ -148,13 +152,52 @@ LimitUpRow = {
 export function parseClistRow(row): StockRow
 /** 纯函数：涨停池原始行 → LimitUpRow（p/1000；fbt/lbt HHMMSS → 'HH:MM:SS'） */
 export function parseLimitUpRow(row): LimitUpRow
+
+// ---- 备选源适配器（Tushare Pro，纯函数，便于离线单测） ----
+/** 纯函数：Tushare `data:{fields,items}` → 对象数组；结构异常（缺 fields/items、行长不符）→ ERR-DATA-001 */
+export function tushareRows(data): object[]
+/** 纯函数：Token 解析。opts 显式值优先；否则 env.KUIBU_TUSHARE_TOKEN，回退 env.TUSHARE_TOKEN；
+ *  空白/null → null（调用方据此静默跳过备源，绝不编造）。不读文件、不写日志。 */
+export function resolveTushareToken(optsToken, env = process.env): string|null
+/** 纯函数：Tushare daily 行 → 未复权中间结构
+ *  vol 手→股 ×100；amount 千元→元 ×1000；trade_date 'YYYYMMDD' → 'YYYY-MM-DD' */
+export function parseTushareDailyRow(row): {
+  date, open, high, low, close, preClose, volume, amount, changePct }
+/** 纯函数：daily 行 + adj_factor 行 → Bar[]
+ *  qfq：price × factor / 窗口内最新 factor；hfq：price × factor；none：原价
+ *  任一交易日缺复权因子 → ERR-DATA-001（绝不把未复权价冒充复权价）；复权价 round4
+ *  limitUp/limitDown 用前一交易日（复权后）收盘 + limitPrices 派生；suspended = volume===0 */
+export function barsFromTushare(dailyRows, adjRows, { code, market, name = '', adjust = 'qfq' }): Bar[]
+/** 纯函数：Tushare dividend 行 → 契约项；仅 `div_proc==='实施'` 且 ex_date 可解析；
+ *  cashPerShare 取税前 `cash_div_tax`（元/股）；bonusShares←stk_bo_rate、capitalizeShares←stk_co_rate（每股） */
+export function parseTushareDividendRow(row): { exDate, cashPerShare, bonusShares, capitalizeShares }|null
+/** 纯函数：Tushare 请求日期窗（end=今天北京时区，start=回看 max(120, days*2+30) 自然日，上限 4000） */
+export function tushareDateRange(days, now = new Date()): { startDate, endDate }
 ```
+
+### 3.1 数据源链（source chain）
+
+`dailyBars` / `dividends` 按 `sources` 顺序尝试，默认 `['eastmoney','tushare']`（东财主源 → Tushare 备源）：
+
+- **未知源名 → ERR-DATA-001**（拼写错误不得静默跳过），`sources: []` 同样拒绝。
+- **Tushare 需要 Token**：`opts.tushareToken` 优先，否则 env `KUIBU_TUSHARE_TOKEN`（兼容 `TUSHARE_TOKEN`）。
+  Token 只从环境/入参读取，**不写入代码、不写账本、不进错误消息**。无 Token → 该源静默跳过
+  （`attempts[i].skipped = 'NO_TOKEN'`），不报错也不伪造数据。
+- 返回的 `source` 是**实际生效**的源（`'eastmoney:push2his'` | `'tushare:daily'` 等），
+  `sourceChain` 是本次尝试的链（去重后的解析结果），`attempts` 按尝试顺序逐源留痕
+  `{ source, ok, skipped?, code?, message? }`（命中即停止，其后源不再尝试；诚实可审计）。
+- **全部源失败 → ERR-DATA-001**，message 汇总各源最后一次失败原因；绝不返回半截/未复权冒充复权。
+- Tushare 日线不提供证券名称，ST 状态未知 → 涨跌停派生按非 ST 规则，返回 `warnings` 明确提示；
+  调用方若知名称可通过 `name` 传入（工具层暂不传）。
+- `retryDelaysMs` 可覆盖默认退避序列（`[]` = 不重试），供单测与运维收紧；默认 `[200,400,800]`。
+- `indexBars` 只走东财（Tushare 指数在 `index_daily`，未纳入本契约），不因备源缺失而失败。
 
 实现要求：
 - 只用 `node:https`/`fetch`，零第三方依赖
 - 失败重试 ≤3 次指数退避；最终失败 `throw new Error('ERR-DATA-001: ...')`
 - 网络不可用时返回明确错误码，**绝不返回伪造或缓存冒充实时的数据**
 - 每次响应记录 `source` 与 `asOf`；`asOf` 早于最近交易日 → `stale: true`
+- 分红送配：东财失败 → Tushare `dividend` 备源；仅取实施中的方案，按 `exDate` 降序
 
 ---
 
