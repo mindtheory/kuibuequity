@@ -28,8 +28,6 @@
 - [x] **备选数据源适配器**：Tushare（需 Token，env `KUIBU_TUSHARE_TOKEN`）作为 dailyBars/dividends 的
   备源；market.js 增加 source 链（eastmoney → tushare），输出标注实际 source。无 Token 时静默跳过备源。
   （2026-11-23 完成，commit a6ce151；20 例新测试，全量 163 测试全绿）
-- [~] **条件单导出 CSV**：`toConditionOrders` 基础上加 `kb_stable action=export`，输出券商条件单
-  导入格式 CSV（触发价/委托价/数量/有效期），UTF-8 BOM，Excel 可直接打开。
 
 ## P2（体验与稳健）
 
@@ -59,3 +57,7 @@
 - [x] P1 备选数据源适配器：`dailyBars`/`dividends` 源链（eastmoney → tushare），Tushare qfq/hfq
   用 daily+adj_factor（缺因子即 ERR-DATA-001，不冒充复权）、dividend 仅取实施方案；返回实际
   `source`/`sourceChain`/`attempts`/`warnings`，无 Token 静默跳过（2026-11-23，commit a6ce151，163 测试全绿）
+- [x] P1 条件单导出 CSV：`kb_stable action=export` 把已锁定契约（t/s/D）+ stable 持仓转成券商条件单
+  CSV（止盈/止损各 1 条，触发价=round2(entry×(1+t|1+s))、委托价=触发价、数量=持仓、有效期=entry+maxHoldDays
+  个交易日），UTF-8 BOM+CRLF+RFC4180，Excel 直开；纯函数 `conditionOrdersFromContracts`/`renderConditionOrdersCsv`，
+  无契约/契约不完整/无可导出行诚实报错，不伪造 CSV（2026-11-24，commit b39d1d9，179 测试全绿）
