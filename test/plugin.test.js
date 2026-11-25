@@ -157,3 +157,29 @@ test('非法参数被 defineTool schema 挡下（INVALID_ARGS，不进业务代�
     (e) => e.code === 'INVALID_ARGS' || /must be one of/.test(e.message),
   );
 });
+
+test('kb_stable export：持仓+锁定契约 → 条件单 CSV（BOM/CRLF/触发价手算）', async () => {
+  // 依赖前序用例的账本：600036 买入 1000 股 @10.00，自动锁定 t=4% / s=−3.2% / D=15（entry.date 2026-11-20）
+  const r = await call('kb_stable', { action: 'export', symbol: '600036' });
+  assert.equal(r.ok, true);
+  assert.equal(r.count, 2, '止盈/止损各 1 条');
+  const [tp, sl] = r.orders;
+  assert.equal(tp.type, 'take_profit');
+  assert.equal(tp.triggerPrice, 10.4, '10.00 × 1.04 = 10.40');
+  assert.equal(sl.triggerPrice, 9.68, '10.00 × 0.968 = 9.68');
+  assert.equal(tp.qty, 1000);
+  assert.equal(tp.validUntil, '2026-12-11', '2026-11-20（周五）+ 15 个交易日');
+  assert.ok(r.csv.startsWith('\ufeffsymbol,side,triggerPrice,orderPrice,qty,validUntil\r\n'), '默认 UTF-8 BOM + CRLF');
+  assert.ok(r.csv.includes('600036,sell,10.4,10.4,1000,2026-12-11\r\n'));
+  assert.equal(r.asOfKind, 'exportedAt', '导出不联网，asOf 是导出时间而非行情时点');
+  assert.ok(r.note.includes('BOM'));
+  assert.ok(r.footnotes.some((f) => f.includes('不构成任何投资建议')));
+});
+
+test('kb_stable export：无可导出标的 → ERR-EXPORT-001（诚实失败，不伪造 CSV）', async () => {
+  const r = await call('kb_stable', { action: 'export', symbol: '000001' });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'ERR-EXPORT-001');
+  assert.equal(r.csv, undefined, '失败时不得返回 CSV');
+  assert.ok(Array.isArray(r.warnings));
+});

@@ -290,9 +290,37 @@ export function buildPlan({ mode, asOf, tradingDay, signals, rejected, footnotes
 export function renderPlanText(plan): string     // 人类可读，含表头/脚注/免责
 export function toConditionOrders(plan): Array   // 券商条件单参数（L1 自动化的落点）
 // 每条：{ symbol, side, triggerPrice, orderPrice, qty, validUntil, priceType }
+/**
+ * 已锁定契约 + 当前持仓 → 条件单参数（纯函数，无网络无时钟）。
+ * 同一标的每个持仓产出 2 条：止盈（t）与止损（s），字段与 toConditionOrders 同口径。
+ */
+export function conditionOrdersFromContracts({ contracts, positions }): {
+  orders: Array,     // { symbol, type:'take_profit'|'stop_loss', side:'sell',
+                     //   triggerPrice, orderPrice, qty, validUntil, priceType:'limit' }
+  warnings: Array,   // { symbol, code, message }；无契约/契约缺 t/s 时留痕，绝不编造行
+}
+/**
+ * 券商条件单导入 CSV（纯函数）：表头固定
+ * symbol,side,triggerPrice,orderPrice,qty,validUntil；CRLF 行尾、RFC4180 转义、
+ * null/undefined → 空单元格；默认带 UTF-8 BOM（Excel 直接双击可读），bom:false 去掉。
+ */
+export function renderConditionOrdersCsv(orders, { bom = true } = {}): string
 ```
 `buildPlan` 必须：整手取整（买 100 倍数，向下）、去重同标的同向、
 被拒信号全部进 `rejected` 不得丢弃、追加固定脚注（as_of + 非投资建议）。
+
+条件单导出口径（L1 自动化的落点，`kb_stable action=export`）：
+- `triggerPrice = round2(entry.price × (1 + takeProfitPct | stopLossPct))`，与 `stable.checkPosition`
+  的条件单参数**同一舍入口径**（2 位小数，四舍五入）；`orderPrice = triggerPrice`（到价即限价挂出）；
+  `qty` 取该标的当前持仓股数（`positions()` 口径，已清仓不导出）。
+- `validUntil = entry.date + maxHoldDays 个交易日`（当前只跳周末，法定节假日未纳入，与
+  `risk.tradingDaysBetween` 同口径；P2「交易日历」任务统一修正）。entry.date 缺失/非法 → `null`
+  （CSV 为空单元格），**不伪造日期**。
+- 契约选取：优先 `position.contractId` 精确匹配，否则退化为该标的最新契约（createdAt 最大）；
+  同一标的只导出一次。
+- 诚实失败：持仓存在但无锁定契约 → warning `STABLE.NO_CONTRACT`；契约缺 `entry.price`/`t`/`s`
+  → warning `STABLE.CONTRACT_INCOMPLETE`；被跳过的不导出伪条件单。`orders` 为空时上层返回
+  `ERR-EXPORT-001`（并原样带出 `warnings`）。
 
 ---
 

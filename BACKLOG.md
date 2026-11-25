@@ -28,7 +28,7 @@
 - [x] **备选数据源适配器**：Tushare（需 Token，env `KUIBU_TUSHARE_TOKEN`）作为 dailyBars/dividends 的
   备源；market.js 增加 source 链（eastmoney → tushare），输出标注实际 source。无 Token 时静默跳过备源。
   （2026-11-23 完成，commit a6ce151；20 例新测试，全量 163 测试全绿）
-- [ ] **条件单导出 CSV**：`toConditionOrders` 基础上加 `kb_stable action=export`，输出券商条件单
+- [~] **条件单导出 CSV**：`toConditionOrders` 基础上加 `kb_stable action=export`，输出券商条件单
   导入格式 CSV（触发价/委托价/数量/有效期），UTF-8 BOM，Excel 可直接打开。
 
 ## P2（体验与稳健）

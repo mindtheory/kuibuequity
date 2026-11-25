@@ -6,6 +6,23 @@
 
 ### Added
 
+- **条件单导出 CSV（`kb_stable action=export`）**：把已锁定契约（t/s/D）与当前 stable 持仓转成券商
+  条件单导入 CSV——每个标的止盈/止损各 1 条（`symbol,side,triggerPrice,orderPrice,qty,validUntil`），
+  `triggerPrice = round2(entry.price × (1+t | 1+s))`（与 `checkPosition` 同一舍入口径）、
+  `orderPrice = triggerPrice`、`qty` 取当前持仓股数、`validUntil = entry.date + maxHoldDays 个交易日`
+  （只跳周末；节假日待 P2 交易日历接入，非法日期留空不伪造）。CSV 带 UTF-8 BOM + CRLF、RFC4180 转义，
+  Excel 双击可读；`symbol` 可选（给了就只导该标的）。诚实失败：持仓无契约 → warning
+  `STABLE.NO_CONTRACT`、契约缺 entry/t/s → `STABLE.CONTRACT_INCOMPLETE`，无可导出行 → `ERR-EXPORT-001`，
+  失败时绝不返回伪造 CSV；导出只读本地账本、不联网，`asOfKind='exportedAt'` 明示 asOf 是导出时间。
+- **纯函数** `src/plan.js#conditionOrdersFromContracts`（契约+持仓→条件单，优先 `position.contractId`
+  精确匹配、否则取最新契约，同标的去重）与 `#renderConditionOrdersCsv`（RFC4180、BOM 可关）。
+- **测试** `test/export-csv.test.js` 14 例（触发价手算 10.40/9.68、10.01→10.41/9.69、15 个交易日
+  → 2026-12-11、契约选取、去重、无契约/契约不完整/非法日期诚实降级、BOM/CRLF/转义/null 空单元格）
+  + `test/plugin.test.js` 2 例（`kb_stable export` 端到端、无可导出标的 ERR-EXPORT-001）；
+  全量 179 测试全绿
+- 文档：`docs/interface.md` §6 新增两个纯函数签名与条件单导出口径（含警告码/CSV 格式），
+  README/design.md 工具表同步 `export` action
+
 - **备选数据源适配器（Tushare 备源 + 数据源链）**：`src/market.js` 的 `dailyBars()`/`dividends()`
   改为按 `sources` 顺序尝试，默认 `['eastmoney','tushare']`；产出的 `source` 为**实际生效源**，
   另返回 `sourceChain`、`attempts`（逐源留痕：`ok` / `skipped:'NO_TOKEN'` / `code` / `message`）与

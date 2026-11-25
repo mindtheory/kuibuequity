@@ -384,7 +384,7 @@ T+1 卖出规则下最早次日可卖：
 | `kb_market` | 行情：实时快照 / 日 K / 分红送配 | `action`, `symbol`, `days` |
 | `kb_account` | 象限账户与持仓：建账/录入成交/查成本/跨象限调拨 | `action`, `quadrant`, `symbol`, `qty`, `price` |
 | `kb_longterm` | 长期：网格参数、成本转负 ETA、分红摊薄模拟 | `symbol`, `action: plan\|simulate\|grid` |
-| `kb_stable` | 稳定：建仓契约、持仓体检、次日指令单、期望值自检 | `action`, `symbol`, `targetPct` |
+| `kb_stable` | 稳定：建仓契约、持仓体检、次日指令单、条件单 CSV 导出、期望值自检 | `action`, `symbol`, `targetPct` |
 | `kb_short` | 短线：候选池打分、离场提醒、情绪总闸状态 | `action`, `topN` |
 | `kb_backtest` | 统一回测（指定象限 + 标的 + 区间） | `mode`, `symbol`, `from`, `to` |
 | `kb_risk` | 风控闸门与红线查询、override 申请与审计 | `action` |

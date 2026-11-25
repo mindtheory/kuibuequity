@@ -56,7 +56,7 @@ dsh --patch ./cordis.patch.yml --profile web   # 覆盖层热加载
 | `kb_market` | 行情：实时快照 / 日 K / 分红送配 |
 | `kb_account` | 象限账本：建账、录入成交、查成本、跨象限调拨（写审计） |
 | `kb_longterm` | 长期：网格参数、成本转负 ETA、分红摊薄模拟 |
-| `kb_stable` | 稳定：建仓契约、持仓体检、次日指令单、期望值自检 |
+| `kb_stable` | 稳定：建仓契约、持仓体检、次日指令单、条件单 CSV 导出、期望值自检 |
 | `kb_short` | 短线：候选池打分、离场提醒、情绪总闸状态 |
 | `kb_backtest` | 统一回测（无未来函数 / T+1 / 整手 / 涨跌停 / 费用） |
 | `kb_risk` | 风控闸门、红线查询、override 申请与审计 |

@@ -301,16 +301,58 @@ function apply(ctx, config) {
   ctx.tools.register(defineTool({
     name: 'kb_stable',
     description:
-      '跬步量化·稳定象限：赚 1%~5% 就走的反人性纪律。action=contract 建仓契约（止盈/止损/期限锁定，override 需理由）；check 持仓体检（是否触发止盈/止损/时间止损，输出条件单参数）；expectancy 期望值自检（胜率不足会直接劝阻）。',
+      '跬步量化·稳定象限：赚 1%~5% 就走的反人性纪律。action=contract 建仓契约（止盈/止损/期限锁定，override 需理由）；check 持仓体检（是否触发止盈/止损/时间止损，输出条件单参数）；export 导出券商条件单 CSV（按已锁定契约的 t/s 算触发价，UTF-8 BOM，Excel 可直开，可选 symbol 过滤）；expectancy 期望值自检（胜率不足会直接劝阻）。',
     parameters: {
-      action: { type: 'string', required: true, enum: ['contract', 'check', 'expectancy'], description: '操作' },
-      symbol: { type: 'string', description: '标的代码（contract/check 必填）' },
+      action: { type: 'string', required: true, enum: ['contract', 'check', 'export', 'expectancy'], description: '操作' },
+      symbol: { type: 'string', description: '标的代码（contract/check 必填；export 可选，给了就只导该标的）' },
       targetPct: { type: 'number', description: '止盈目标（百分数，如 3 表示 3%）；留空按 ATR 自适应' },
       days: { type: 'integer', description: '取用的日K根数，默认 250' },
     },
     output: TEXT_OUTPUT,
     async execute(args) {
       try {
+        // ---- 条件单导出：只读本地账本（契约 + 持仓），不联网、不读取实时行情 ----
+        if (args.action === 'export') {
+          const [ledgerMod, planMod] = await Promise.all([tryImport('./src/ledger.js'), tryImport('./src/plan.js')]);
+          if (!ledgerMod || !ledgerMod.makeLedger) return moduleMissing('账本', './src/ledger.js');
+          if (!planMod || !planMod.conditionOrdersFromContracts || !planMod.renderConditionOrdersCsv) {
+            return moduleMissing('条件单导出', './src/plan.js');
+          }
+          const ledger = ledgerMod.makeLedger(dataDir);
+          const contracts = (ledger.contracts() || []).filter((c) => c.quadrant === 'stable');
+          const positions = (ledger.positions('stable') || []).filter((p) => !args.symbol || p.symbol === args.symbol);
+          const { orders, warnings } = planMod.conditionOrdersFromContracts({ contracts, positions });
+          const asOf = new Date().toISOString();
+          if (!orders.length) {
+            return {
+              ok: false,
+              code: 'ERR-EXPORT-001',
+              message: args.symbol
+                ? `稳定象限标的 ${args.symbol} 没有可导出的条件单：需要「持仓 + 锁定契约」。先录入买入成交（自动锁契约）或 kb_stable action=contract 补建。`
+                : '稳定象限没有可导出的条件单：需要「持仓 + 锁定契约」。先录入买入成交（自动锁契约）或 kb_stable action=contract 补建。',
+              asOf,
+              asOfKind: 'exportedAt',
+              warnings,
+              footnotes: [DISCLAIMER],
+            };
+          }
+          return {
+            ok: true,
+            action: 'export',
+            asOf,
+            asOfKind: 'exportedAt',
+            count: orders.length,
+            ...(args.symbol ? { symbol: args.symbol } : {}),
+            orders,
+            warnings,
+            csv: planMod.renderConditionOrdersCsv(orders),
+            note:
+              `条件单 CSV ${orders.length} 行（每个标的止盈/止损各 1 条；触发价 = 契约 entry × (1+t/s)），` +
+              '含 UTF-8 BOM 与 CRLF，保存为 .csv 可直接用 Excel 打开并导入券商条件单；' +
+              'asOf 为导出时间（非行情时点），validUntil 只跳周末、法定节假日未纳入。',
+            footnotes: [DISCLAIMER],
+          };
+        }
         const strat = await tryImport('./src/strategies/index.js');
         if (!strat || !strat.registry || !strat.registry.stable) return moduleMissing('稳定策略', './src/strategies/index.js');
         const stable = strat.registry.stable;

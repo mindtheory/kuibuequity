@@ -90,6 +90,113 @@ export function toConditionOrders(plan) {
   return out;
 }
 
+/** 条件单 CSV 表头（券商导入格式：触发价/委托价/数量/有效期） */
+export const CONDITION_ORDER_CSV_HEADER = ['symbol', 'side', 'triggerPrice', 'orderPrice', 'qty', 'validUntil'];
+
+const round2 = (x) => Math.round(x * 100) / 100;
+
+/**
+ * 纯函数：日期 + n 个交易日（只跳周末）。非法日期/非法 n → null，绝不编造日期。
+ * 法定节假日未纳入（与 risk.tradingDaysBetween 同口径，待 P2 交易日历任务统一修正）。
+ */
+function addTradingDays(dateStr, n) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateStr ?? ''));
+  if (!m) return null;
+  const days = Number(n);
+  if (!Number.isInteger(days) || days < 1) return null;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const da = Number(m[3]);
+  const d = new Date(Date.UTC(y, mo - 1, da));
+  // 2026-02-30 之类溢出日期必须拒绝（Date 会自动进位，不能用它冒充真日期）
+  if (Number.isNaN(d.getTime()) || d.getUTCMonth() !== mo - 1 || d.getUTCDate() !== da) return null;
+  let left = days;
+  while (left > 0) {
+    d.setUTCDate(d.getUTCDate() + 1);
+    const dow = d.getUTCDay();
+    if (dow !== 0 && dow !== 6) left -= 1;
+  }
+  return d.toISOString().slice(0, 10);
+}
+
+/**
+ * 已锁定契约 + 当前持仓 → 条件单参数（纯函数，无网络无时钟）。
+ *
+ * 口径与 stable.checkPosition 的 conditionOrders **完全一致**：
+ *   triggerPrice(take_profit) = round2(entry.price × (1 + takeProfitPct))
+ *   triggerPrice(stop_loss)   = round2(entry.price × (1 + stopLossPct))
+ *   orderPrice = triggerPrice（到价即限价挂出），qty = 当前持仓股数
+ *   validUntil = entry.date + maxHoldDays 个交易日（只跳周末）
+ *
+ * 诚实失败：持仓无锁定契约 / 契约缺 entry.price 或 t/s → 只进 warnings，不导出伪条件单。
+ */
+export function conditionOrdersFromContracts({ contracts, positions } = {}) {
+  if (!Array.isArray(contracts) || !Array.isArray(positions)) {
+    throw new Error('ERR-EXPORT-001: contracts 与 positions 必须是数组');
+  }
+  const byId = new Map();
+  const latestBySymbol = new Map();
+  for (const c of contracts) {
+    if (!c || !c.symbol) continue;
+    if (c.id != null) byId.set(c.id, c);
+    const prev = latestBySymbol.get(c.symbol);
+    if (!prev || String(c.createdAt ?? '').localeCompare(String(prev.createdAt ?? '')) >= 0) {
+      latestBySymbol.set(c.symbol, c);
+    }
+  }
+
+  const orders = [];
+  const warnings = [];
+  const seen = new Set();
+  for (const p of positions) {
+    if (!p || !p.symbol || seen.has(p.symbol)) continue; // 同一标的只导出一次
+    const qty = Number(p.qty);
+    if (!(qty > 0)) continue; // 已清仓不导出
+    seen.add(p.symbol);
+
+    const contract = (p.contractId != null ? byId.get(p.contractId) : null) || latestBySymbol.get(p.symbol) || null;
+    if (!contract) {
+      warnings.push({ symbol: p.symbol, code: 'STABLE.NO_CONTRACT', message: '该持仓无锁定契约：先用 kb_stable action=contract 补建，不导出伪条件单' });
+      continue;
+    }
+    // null/undefined 必须视为缺失（Number(null)=0 会冒充合法比例，绝不允许）
+    const entryPrice = contract.entry?.price == null ? NaN : Number(contract.entry.price);
+    const t = contract.takeProfitPct == null ? NaN : Number(contract.takeProfitPct);
+    const s = contract.stopLossPct == null ? NaN : Number(contract.stopLossPct);
+    if (!(entryPrice > 0) || !Number.isFinite(t) || !Number.isFinite(s)) {
+      warnings.push({ symbol: p.symbol, code: 'STABLE.CONTRACT_INCOMPLETE', message: '契约缺 entry.price 或止盈/止损比例，无法计算触发价' });
+      continue;
+    }
+    const validUntil = addTradingDays(contract.entry?.date, contract.maxHoldDays);
+    const base = { symbol: p.symbol, side: 'sell', qty, validUntil, priceType: 'limit' };
+    const tp = round2(entryPrice * (1 + t));
+    const sl = round2(entryPrice * (1 + s));
+    orders.push({ ...base, type: 'take_profit', triggerPrice: tp, orderPrice: tp });
+    orders.push({ ...base, type: 'stop_loss', triggerPrice: sl, orderPrice: sl });
+  }
+  return { orders, warnings };
+}
+
+/** RFC4180 单元格：null/undefined → 空；含逗号/引号/换行 → 双引号包裹并转义内部引号 */
+function csvCell(v) {
+  if (v == null) return '';
+  const s = String(v);
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+/**
+ * 券商条件单导入 CSV（纯函数）：固定表头 + CRLF 行尾 + 默认 UTF-8 BOM（Excel 直接可读）。
+ * 行内字段缺失写空单元格，绝不写 "null"/"NaN" 字符串。
+ */
+export function renderConditionOrdersCsv(orders, { bom = true } = {}) {
+  if (!Array.isArray(orders)) throw new Error('ERR-EXPORT-001: orders 必须是数组');
+  const lines = [CONDITION_ORDER_CSV_HEADER.join(',')];
+  for (const o of orders) {
+    lines.push(CONDITION_ORDER_CSV_HEADER.map((k) => csvCell(o?.[k])).join(','));
+  }
+  return `${bom ? '\ufeff' : ''}${lines.join('\r\n')}\r\n`;
+}
+
 /** 人类可读渲染（模型可直接转述给用户） */
 export function renderPlanText(plan) {
   const lines = [];
