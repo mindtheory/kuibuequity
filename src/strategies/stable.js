@@ -8,6 +8,7 @@
 import { atrPct, sma, slope } from '../indicators.js';
 import { buildPlan } from '../plan.js';
 import { expectancyCheck } from '../risk.js';
+import { tradingDaysBetween } from '../calendar.js';
 
 export const meta = {
   mode: 'stable',
@@ -127,6 +128,10 @@ export function buildLockedContract({ bars, symbol, entry, config = {}, note } =
 /**
  * 持仓体检（契约驱动）：止盈/止损/时间到期 → 动作 + 条件单参数
  * 契约锁定：contract 的 t/s/D 建仓时写死，改需 override（risk.js/ledger.js 负责审计）
+ *
+ * 时间止损口径（interface.md §11）：holdDays 优先用显式 contract.holdDays；未给时按
+ * **真实交易日** 从 contract.entry.date 数到最后一根 bar 的日期（周末 + 法定节假日都跳过）。
+ * 两头都拿不到日期 → holdDays=null（不按 0 冒充"刚建仓"，也不误触发时间止损）。
  */
 export function checkPosition({ bars, contract, position }) {
   if (!contract || !position) {
@@ -138,17 +143,27 @@ export function checkPosition({ bars, contract, position }) {
   const ret = px / entry - 1;
   const t = Number(contract.takeProfitPct);
   const s = Number(contract.stopLossPct);
-  const holdDays = Number(contract.holdDays ?? 0);
+  let holdDays = null;
+  if (contract.holdDays != null && Number.isFinite(Number(contract.holdDays))) {
+    holdDays = Number(contract.holdDays);
+  } else if (contract.entry?.date && last?.date) {
+    try {
+      holdDays = tradingDaysBetween(contract.entry.date, last.date);
+    } catch {
+      holdDays = null; // 日历越界/日期非法：明确"算不出"，不拿近似值冒充时间止损
+    }
+  }
   const conditionOrders = [
     { type: 'take_profit', triggerPrice: Math.round(entry * (1 + t) * 100) / 100, side: 'sell', qty: position?.qty },
     { type: 'stop_loss', triggerPrice: Math.round(entry * (1 + s) * 100) / 100, side: 'sell', qty: position?.qty },
   ];
-  if (ret >= t) return { action: 'take_profit', hitRule: 'STABLE.TP_HIT', detail: `浮盈 ${(ret * 100).toFixed(2)}% ≥ 目标 ${(t * 100).toFixed(2)}%，落袋`, conditionOrders };
-  if (ret <= s) return { action: 'stop_loss', hitRule: 'STABLE.SL_HIT', detail: `浮亏 ${(ret * 100).toFixed(2)}% ≤ 止损 ${(s * 100).toFixed(2)}%，无条件离场`, conditionOrders };
-  if (holdDays >= Number(contract.maxHoldDays)) {
-    return { action: 'time_exit', hitRule: 'STABLE.TIME_EXIT', detail: `持仓 ${holdDays} 日 ≥ ${contract.maxHoldDays} 日时间止损，释放资金效率`, conditionOrders };
+  const base = { holdDays, conditionOrders };
+  if (ret >= t) return { ...base, action: 'take_profit', hitRule: 'STABLE.TP_HIT', detail: `浮盈 ${(ret * 100).toFixed(2)}% ≥ 目标 ${(t * 100).toFixed(2)}%，落袋` };
+  if (ret <= s) return { ...base, action: 'stop_loss', hitRule: 'STABLE.SL_HIT', detail: `浮亏 ${(ret * 100).toFixed(2)}% ≤ 止损 ${(s * 100).toFixed(2)}%，无条件离场` };
+  if (holdDays != null && holdDays >= Number(contract.maxHoldDays)) {
+    return { ...base, action: 'time_exit', hitRule: 'STABLE.TIME_EXIT', detail: `持仓 ${holdDays} 日 ≥ ${contract.maxHoldDays} 日时间止损，释放资金效率` };
   }
-  return { action: 'hold', hitRule: 'STABLE.HOLD', detail: `浮盈 ${(ret * 100).toFixed(2)}%，区间内持有；条件单已挂`, conditionOrders };
+  return { ...base, action: 'hold', hitRule: 'STABLE.HOLD', detail: `浮盈 ${(ret * 100).toFixed(2)}%，区间内持有；条件单已挂` };
 }
 
 export function evaluate({ bars, indexBars, position, contract, account, config = {}, symbol, stats }) {

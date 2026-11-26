@@ -4,6 +4,7 @@
  * 设计依据：docs/design.md §4.6/§5.4/§6.5、docs/risk.md
  * 立场：风控是"事前写死的红线"，事中不可临时更改；硬红线连 override 都不接受。
  */
+import { tradingDaysBetween } from './calendar.js';
 
 export const QUADRANTS = ['long', 'stable', 'short'];
 
@@ -162,6 +163,7 @@ export function sentimentGate({ indexAboveMa5, yesterdayLimitUpPremium, blowUpRa
 /** 短线 5 日硬期限：唯一不可 override 的硬红线 */
 export function hardExitCheck({ openDate, asOf, maxHoldDays = RED_LINES.short.hardMaxHoldDays }) {
   if (!openDate || !asOf) return { mustExit: false };
+  // 真实交易日（周末 + 法定节假日 + 交易所额外休市）；越界抛 ERR-CALENDAR-001，不拿近似值冒充
   const days = tradingDaysBetween(openDate, asOf);
   return {
     mustExit: days >= maxHoldDays,
@@ -172,17 +174,8 @@ export function hardExitCheck({ openDate, asOf, maxHoldDays = RED_LINES.short.ha
   };
 }
 
-/** 简易交易日计数（跳过周末；不含法定节假日，节假日按保守多算处理） */
-export function tradingDaysBetween(fromDate, toDate) {
-  const a = new Date(`${fromDate}T00:00:00Z`);
-  const b = new Date(`${toDate}T00:00:00Z`);
-  if (!(a < b)) return 0;
-  let n = 0;
-  const cur = new Date(a);
-  while (cur < b) {
-    cur.setUTCDate(cur.getUTCDate() + 1);
-    const dow = cur.getUTCDay();
-    if (dow !== 0 && dow !== 6) n++;
-  }
-  return n;
-}
+/**
+ * 交易日计数：唯一实现在 src/calendar.js（本处 re-export 兼容既有调用方）。
+ * 口径：(from, to] 半开区间、不含建仓当日、含 asOf 当日；节假日已纳入，越界抛 ERR-CALENDAR-001。
+ */
+export { tradingDaysBetween };

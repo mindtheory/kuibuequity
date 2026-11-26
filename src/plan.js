@@ -4,6 +4,7 @@
  * 设计依据：docs/design.md §3.2、docs/interface.md §6
  * 立场：插件只产出"指令单"，由人（或券商条件单）执行；被风控挡下的必须留痕。
  */
+import { addTradingDays } from './calendar.js';
 
 /** 固定免责脚注（P7：每个输出带 as_of 与非投资建议） */
 export const DISCLAIMER = '本指令单由规则自动生成，不构成投资建议；历史回测不代表未来表现，交易风险自负。';
@@ -96,39 +97,16 @@ export const CONDITION_ORDER_CSV_HEADER = ['symbol', 'side', 'triggerPrice', 'or
 const round2 = (x) => Math.round(x * 100) / 100;
 
 /**
- * 纯函数：日期 + n 个交易日（只跳周末）。非法日期/非法 n → null，绝不编造日期。
- * 法定节假日未纳入（与 risk.tradingDaysBetween 同口径，待 P2 交易日历任务统一修正）。
- */
-function addTradingDays(dateStr, n) {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateStr ?? ''));
-  if (!m) return null;
-  const days = Number(n);
-  if (!Number.isInteger(days) || days < 1) return null;
-  const y = Number(m[1]);
-  const mo = Number(m[2]);
-  const da = Number(m[3]);
-  const d = new Date(Date.UTC(y, mo - 1, da));
-  // 2026-02-30 之类溢出日期必须拒绝（Date 会自动进位，不能用它冒充真日期）
-  if (Number.isNaN(d.getTime()) || d.getUTCMonth() !== mo - 1 || d.getUTCDate() !== da) return null;
-  let left = days;
-  while (left > 0) {
-    d.setUTCDate(d.getUTCDate() + 1);
-    const dow = d.getUTCDay();
-    if (dow !== 0 && dow !== 6) left -= 1;
-  }
-  return d.toISOString().slice(0, 10);
-}
-
-/**
  * 已锁定契约 + 当前持仓 → 条件单参数（纯函数，无网络无时钟）。
  *
  * 口径与 stable.checkPosition 的 conditionOrders **完全一致**：
  *   triggerPrice(take_profit) = round2(entry.price × (1 + takeProfitPct))
  *   triggerPrice(stop_loss)   = round2(entry.price × (1 + stopLossPct))
  *   orderPrice = triggerPrice（到价即限价挂出），qty = 当前持仓股数
- *   validUntil = entry.date + maxHoldDays 个交易日（只跳周末）
+ *   validUntil = entry.date + maxHoldDays 个交易日（真实交易日，见 src/calendar.js）
  *
- * 诚实失败：持仓无锁定契约 / 契约缺 entry.price 或 t/s → 只进 warnings，不导出伪条件单。
+ * 诚实失败：持仓无锁定契约 / 契约缺 entry.price 或 t/s → 只进 warnings，不导出伪条件单；
+ * 有效期走出交易日历覆盖范围 → validUntil 留空 + warning STABLE.CALENDAR_UNCOVERED，不编造日期。
  */
 export function conditionOrdersFromContracts({ contracts, positions } = {}) {
   if (!Array.isArray(contracts) || !Array.isArray(positions)) {
@@ -167,7 +145,18 @@ export function conditionOrdersFromContracts({ contracts, positions } = {}) {
       warnings.push({ symbol: p.symbol, code: 'STABLE.CONTRACT_INCOMPLETE', message: '契约缺 entry.price 或止盈/止损比例，无法计算触发价' });
       continue;
     }
-    const validUntil = addTradingDays(contract.entry?.date, contract.maxHoldDays);
+    let validUntil = null;
+    try {
+      // 真实交易日（src/calendar.js）：周末 + 法定节假日 + 交易所额外休市都跳过
+      validUntil = addTradingDays(contract.entry?.date, contract.maxHoldDays);
+    } catch (e) {
+      // 日期合法但走出日历覆盖范围 → 有效期留空 + 留痕，绝不编造日期
+      warnings.push({
+        symbol: p.symbol,
+        code: 'STABLE.CALENDAR_UNCOVERED',
+        message: `条件单有效期留空（不伪造日期）：${e && e.message ? e.message : e}`,
+      });
+    }
     const base = { symbol: p.symbol, side: 'sell', qty, validUntil, priceType: 'limit' };
     const tp = round2(entryPrice * (1 + t));
     const sl = round2(entryPrice * (1 + s));

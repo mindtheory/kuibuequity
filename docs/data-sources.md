@@ -332,7 +332,7 @@ attempt 3: 等待 2000ms (+0~800ms)
 | 日 K | 至当日 15:30 后失效 | 收盘后需重取以纳入当日 bar |
 | 分红送配 | 24h | 低频变化 |
 | 涨停池 | 当日有效 | 收盘后固化 |
-| 交易日历 | 7d | **计划** |
+| 交易日历 | 年（国务院年度通知） | **已实现**：内置年度表（`src/calendar.js`，2024~2027），不联网、不缓存，每年更新源码 |
 
 ---
 
@@ -450,10 +450,14 @@ limitDown = (low  == limitDownPrice) and (close == limitDownPrice)
 ### 6.3 陈旧（stale）判定
 
 ```
-lastTradingDay = 交易日历上 ≤ today 的最后一个交易日
+lastTradingDay = 交易日历上 ≤ today 的最后一个交易日（src/calendar.js#lastTradingDayOnOrBefore）
 stale = (asOf 的日期 < lastTradingDay)
       或 (盘中时段 asOf 落后当前 > 5 分钟)
 ```
+
+实现说明：`market.computeStale` 已锚定真实交易日（节假日不算交易日——国庆期间 9/30 的数据
+不会因为日历翻到 10/5 就被误判陈旧）；若当年年度表尚未维护（日历未覆盖），回退"最近工作日"，
+只会**高估**陈旧，绝不把旧数据说成新鲜。年度维护流程见 `interface.md` §11。
 
 后果（design.md P7）：`stale: true` + 脚注"数据截至 <asOf>，已落后 N 个交易日，指令单仅供参考"；
 超过 1 个交易日仍要生成买入指令时 → `ERR-DATA-003` 直接拒绝。
@@ -515,9 +519,9 @@ Token 由用户本地环境变量提供（`KUIBU_TUSHARE_TOKEN`，兼容旧名 `
 | 炸板池 | 未列入 interface.md | **计划**（需先补契约） |
 | 短线候选池 `buildCandidatePool` | interface.md §7.3 | ✅ 已实现（纯函数：ST/次新/市值/成交额/一字板剔除） |
 | 限频/重试/镜像降级 | interface.md §3 要求 | 重试 ✅ / 页间退避 ✅ / 镜像降级待接 |
-| 交易日历 | 未定义 | **计划**（需新增契约条目） |
+| 交易日历 | interface.md §11 | ✅ 已实现（纯函数内置年度表 2024~2027；周末+法定节假日+2024 除夕交易所休市；越界 ERR-CALENDAR-001） |
 
-> 契约缺口（仍待补）：交易日历（冷静期/熔断计数必需）、炸板池与昨日涨停溢价
+> 契约缺口（仍待补）：炸板池与昨日涨停溢价
 > （情绪总闸的 `yesterdayLimitUpPremium` / `blowUpRate` 两个输入）。
 > 按"契约先行"原则，需先补 `interface.md` 再实现，本文只做记录，不擅自定义字段名。
 >

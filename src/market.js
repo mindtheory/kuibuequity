@@ -8,6 +8,8 @@
  * 只用 global fetch + AbortController，零第三方依赖。
  */
 
+import { lastTradingDayOnOrBefore } from './calendar.js';
+
 // ---------------------------------------------------------------------------
 // 常量与缓存
 // ---------------------------------------------------------------------------
@@ -235,7 +237,8 @@ export function barsFromKlines(klines, { code = '', market = '', name = '' } = {
 }
 
 /**
- * 最近工作日（北京时区，跳过周末；法定节假日未纳入，保守口径见 risk.tradingDaysBetween）。
+ * 最近工作日（北京时区，只跳周末）——仅作 `computeStale` 在交易日历未覆盖年份的兜底。
+ * 真实交易日请用 src/calendar.js#lastTradingDayOnOrBefore（节假日已纳入）。
  * @param {Date} now
  * @param {number} offsetMinutes 相对 UTC 的分钟偏移，默认 +480（Asia/Shanghai）
  */
@@ -247,10 +250,22 @@ export function latestWeekdayString(now = new Date(), offsetMinutes = 480) {
   return shifted.toISOString().slice(0, 10);
 }
 
-/** 陈旧判定：asOf(YYYY-MM-DD) 早于最近工作日 → true */
+/**
+ * 陈旧判定：asOf(YYYY-MM-DD) 早于**最近交易日** → true。
+ * 最近交易日走 src/calendar.js（节假日不算交易日，如国庆期间应锚定节前最后一个交易日）；
+ * 日历未覆盖的年份（未来年份未维护年度表）→ 回退最近工作日：只会**高估**陈旧（宁可多报 stale，
+ * 绝不把陈旧数据说成新鲜），不会伪造交易日。
+ */
 export function computeStale(asOf, now = new Date(), offsetMinutes = 480) {
   if (!asOf) return true;
-  return String(asOf).slice(0, 10) < latestWeekdayString(now, offsetMinutes);
+  const today = new Date(now.getTime() + offsetMinutes * 60000).toISOString().slice(0, 10);
+  let reference;
+  try {
+    reference = lastTradingDayOnOrBefore(today);
+  } catch {
+    reference = latestWeekdayString(now, offsetMinutes);
+  }
+  return String(asOf).slice(0, 10) < reference;
 }
 
 /** 北京时区今天 YYYYMMDD（涨停池 date 参数；market.js 允许读时钟） */

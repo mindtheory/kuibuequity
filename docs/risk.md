@@ -187,11 +187,27 @@ gate 检查:
 ### 3.4 交易日计数
 
 ```text
-tradingDaysBetween(from, to)   # 跳过周六日；不含法定节假日表
+tradingDaysBetween(from, to)   # 真实交易日：周末 + 法定节假日 + 交易所额外休市全部跳过
+                               # 半开区间 (from, to]：不含 from、含 to；from >= to → 0
 ```
 
-当前实现（`src/risk.js`）**只跳周末**，节假日按"多算"处理（保守：冷静期/熔断提前解除的风险远小于延后解除）。
-接入交易日历（东方财富节假日接口或内置年度表）为**计划**项，见澄清项 R4。
+唯一实现在 `src/calendar.js`（契约见 `docs/interface.md` §11），`src/risk.js` 只 re-export 兼容既有调用。
+年度表内置 2024-01-01~2027-12-31：
+
+| 年 | 工作日休市 | 交易日 |
+| :-- | :-- | :-- |
+| 2024 | 19 天法定 + 除夕 2/9 交易所休市 = 20 | 262 − 20 = 242 |
+| 2025 | 18 天法定（春节含除夕） | 261 − 18 = 243 |
+| 2026 | 19 天法定 | 261 − 19 = 242 |
+| 2027 | 18 天法定（春节含除夕） | 261 − 18 = 243 |
+
+口径与诚实失败（P6）：
+- 交易日 = 周一~周五 且 不在年度表；**调休上班的周末 A 股并不开市**，不补为交易日。
+- 超出覆盖范围（如 2028 年）→ 抛 `ERR-CALENDAR-001`，**不回退到"只跳周末"**：
+  回退会把春节/国庆算成交易日，硬红线提前砍仓、冷静期/熔断提前解除，属于伪造计数。
+- 溢出日（`2026-02-30`）一律拒绝，`Date` 自动进位不得冒充真日期。
+- 年度维护：国务院新一年通知发布后更新 `HOLIDAYS`/`EXCHANGE_EXTRA_CLOSED`/`CALENDAR_COVERAGE`，
+  同步扩 `test/calendar.test.js` 年度计数用例。见澄清项 R4（已关闭）。
 
 ---
 
@@ -381,7 +397,7 @@ overrideContract({ contractId, patch, reason }):
 | R1 | 闸门顺序中「象限启用」「象限上限」两步 | `interface.md` §5 列出，`src/risk.js` 未实现 | 按契约顺序文档化，标注**计划** | 实现时补 `quadrantValue` 检查与 `ERR-RISK-004` |
 | R2 | 熔断时长 5 交易日 | design.md §5.4 有，`RED_LINES` 无字段 | 文档化为常量 `circuitBreakerDays = 5` | **计划**：在 `RED_LINES.stable` 增字段（先改 interface.md） |
 | R3 | 周回撤阈值 `>` vs `>=` | design.md 写 ">3%"，实现用 `>=` | 以 `>=`（保守侧）为准 | 建议 design.md 统一为 `≥` |
-| R4 | 交易日计数不含节假日 | `tradingDaysBetween` 只跳周末 | 保守可接受，文档已说明 | **计划**：接入交易日历 |
+| R4 | 交易日计数不含节假日 | ~~`tradingDaysBetween` 只跳周末~~ → 已接入 `src/calendar.js` 内置年度表（2024~2027，含 2024 除夕交易所休市），越界 `ERR-CALENDAR-001` | 真实交易日计数 | **已解决（2026-11-26）**：接口见 `interface.md` §11 |
 | R5 | 情绪指标缺失时默认放行 | 实现 `NaN` 比较为假 → 放行 | 应改为缺失即关闭 | **计划**：先改 `interface.md` 空值语义 |
 | R6 | 人工暂停象限的错误码 | 无专用码 | 暂复用 `ERR-RISK-002` 并在 reason 注明"人工暂停" | **计划**：新增 `ERR-RISK-008`（需先改 interface.md §10） |
 | R7 | 超期持仓拒绝新开仓 | `interface.md` §5 要求，`gate()` 未实现 | 文档化为第 0c 步，标注**计划** | 实现时补 |
@@ -395,6 +411,7 @@ overrideContract({ contractId, patch, reason }):
 - [ ] 被拒信号全部进 `plan.rejected`，无静默丢弃
 - [ ] 止损/强制离场路径不受风控阻断（恒放行）
 - [ ] 硬红线（短线 5 日）在 `overrideContract` 里被显式拦截
+- [ ] 所有"交易日"计数走 `src/calendar.js#tradingDaysBetween`（节假日已纳入），越界 `ERR-CALENDAR-001` 明确失败
 - [ ] 熔断/冷静期解除后计数归零，不残留
 - [ ] 期望值自检使用含费实现盈亏
 - [ ] 每次 override 都有非空 `reason` 且写入 `audit.jsonl`

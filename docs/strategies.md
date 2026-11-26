@@ -406,10 +406,15 @@ STABLE.REDUCE:
       emit Signal(take_profit, qty=all, rule='STABLE.TP_HIT')     # 默认一次清仓
   elif bars.last.high >= entry * (1 + t * 0.7) and bars.last.close < bars.last.open:
       emit Signal(sell, qty=half, rule='STABLE.TP_PARTIAL')       # 冲高分批（可选）
-  elif 时间止损: bars.last.holdDays >= D and 未触发 t/s:
+  elif 时间止损: holdDays >= D and 未触发 t/s:
       emit Signal(sell, qty=all, rule='STABLE.TIME_EXIT')         # 释放资金效率
   else: hold
 ```
+
+`holdDays` 口径（`interface.md` §11）：优先用契约上显式记录的 `holdDays`；缺失时按
+`src/calendar.js#tradingDaysBetween(entry.date, bars.last.date)` 用**真实交易日**计算
+（周末 + 法定节假日 + 交易所额外休市都跳过，如 2026 春节 2/16~2/23 不计入）。
+两头都拿不到日期 → `holdDays=null`：不按 0 天冒充"刚建仓"，也不误触发时间止损。
 
 ### (d) 离场（止损优先于一切，且不接受讨价还价）
 
@@ -645,6 +650,8 @@ SHORT.EXIT:
   if tradingDaysBetween(openDate, asOf) >= 5:
       emit force_exit(qty=all, price='收盘前市价') rule='SHORT.HARD_EXIT_5D'
       # gate() 对 force_exit 恒放行；任何 override 请求 → ERR-OVERRIDE-001
+      # 硬红线计数用真实交易日（src/calendar.js）：春节/国庆整段休市不算持仓天数，
+      # 越出日历覆盖范围 → ERR-CALENDAR-001（绝不回退到只跳周末、提前砍仓）
   on 平仓:
       更新滚动 30 笔统计 → expectancyCheck(payoffRatio 实测)
       if verdict == NOT_RECOMMENDED: 象限停用 ERR-RISK-006

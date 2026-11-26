@@ -77,6 +77,7 @@ kuibuequity/
 │   ├── indicators.js         # 【纯函数】SMA EMA RSI MACD BOLL ATR
 │   ├── costs.js              # 【纯函数】A股交易成本 + 含分红的持仓成本核算
 │   ├── backtest.js           # 【纯函数】无未来函数回测引擎（T+1/涨跌停/整手）
+│   ├── calendar.js           # 【纯函数】A股交易日历（周末+法定节假日+交易所额外休市，年度表）
 │   ├── ledger.js             # 账户账本：JSON 原子写，持仓/流水/契约/审计
 │   ├── risk.js               # 风控闸门：仓位上限/连亏熔断/冷静期/红线
 │   ├── plan.js               # 指令单（OrderPlan）构造与校验

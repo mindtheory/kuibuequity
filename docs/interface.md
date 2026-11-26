@@ -276,10 +276,21 @@ export function expectancyCheck({ trades, payoffRatio }): {
 export function sentimentGate({ indexAboveMa5, yesterdayLimitUpPremium, blowUpRate }):
   { open:boolean, reason:string }
 // 指数跌破 5 日线 或 昨日涨停平均溢价 < 0 或 炸板率 > 0.4 → open:false
+
+/** 短线 5 日硬期限（唯一不可 override 的红线） */
+export function hardExitCheck({ openDate, asOf, maxHoldDays = 5 }): {
+  mustExit:boolean, holdDays:number, remaining:number, rule:'SHORT.HARD_EXIT_5D', note:string }
+// holdDays = tradingDaysBetween(openDate, asOf)：**真实交易日**（周末 + 法定节假日 + 交易所额外休市）
+// 计数区间为半开区间 (openDate, asOf]：不含建仓当日、含 asOf 当日（沿用既有口径，不改硬红线触发点）
+
+// 交易日计数唯一实现是 src/calendar.js（§11），risk.js 只做 re-export 兼容既有调用方：
+export { tradingDaysBetween } from './calendar.js';
 ```
 
 **硬红线**：`short.hardMaxHoldDays` 的强制离场指令**不接受 override**；
 `gate()` 对 `action==='force_exit'` 恒放行，对 `action==='buy'` 在超期持仓存在时拒绝。
+**日历越界即失败**：`openDate`/`asOf` 超出内置交易日历覆盖范围 → 抛 `ERR-CALENDAR-001`，
+不回退到"只跳周末"（那会把法定节假日算成交易日，等于伪造计数）。
 
 ---
 
@@ -313,9 +324,11 @@ export function renderConditionOrdersCsv(orders, { bom = true } = {}): string
 - `triggerPrice = round2(entry.price × (1 + takeProfitPct | stopLossPct))`，与 `stable.checkPosition`
   的条件单参数**同一舍入口径**（2 位小数，四舍五入）；`orderPrice = triggerPrice`（到价即限价挂出）；
   `qty` 取该标的当前持仓股数（`positions()` 口径，已清仓不导出）。
-- `validUntil = entry.date + maxHoldDays 个交易日`（当前只跳周末，法定节假日未纳入，与
-  `risk.tradingDaysBetween` 同口径；P2「交易日历」任务统一修正）。entry.date 缺失/非法 → `null`
-  （CSV 为空单元格），**不伪造日期**。
+- `validUntil = entry.date + maxHoldDays 个交易日`（`src/calendar.js#addTradingDays`，**真实交易日**：
+  周末 + 法定节假日 + 交易所额外休市日全部跳过，覆盖 2024-01-01~2027-12-31）。
+  entry.date 缺失/非法 → `null`（CSV 为空单元格），**不伪造日期**；entry.date 合法但日期落出日历
+  覆盖范围 → `validUntil=null` + warning `STABLE.CALENDAR_UNCOVERED`（该标的其余字段照常导出，
+  只留空有效期，绝不编造日期）。
 - 契约选取：优先 `position.contractId` 精确匹配，否则退化为该标的最新契约（createdAt 最大）；
   同一标的只导出一次。
 - 诚实失败：持仓存在但无锁定契约 → warning `STABLE.NO_CONTRACT`；契约缺 `entry.price`/`t`/`s`
@@ -442,3 +455,58 @@ export function apply(ctx, config) { ctx.tools.register(defineTool({...})) ... }
 | `ERR-PLAN-002` | 涨跌停/停牌导致无法成交 |
 | `ERR-CONTRACT-001` | 契约锁定，修改需 override + reason |
 | `ERR-OVERRIDE-001` | 硬红线不可 override（短线 5 日强制离场） |
+| `ERR-CALENDAR-001` | 交易日历不支持该日期（非法日期 / 超出内置覆盖范围），禁止回退到"只跳周末" |
+
+---
+
+## 11. `src/calendar.js` — 交易日历（纯函数）
+
+> 唯一事实源：本节的覆盖范围、计数口径与错误语义。实现不得另立一套"只跳周末"的近似。
+
+```js
+export const CALENDAR_VERSION = '2026.11';          // 年度表版本，每年国务院通知发布后更新
+export const CALENDAR_COVERAGE = { from: '2024-01-01', to: '2027-12-31',
+                                   years: [2024, 2025, 2026, 2027] };
+export const HOLIDAYS = { 2024: [...], 2025: [...], 2026: [...], 2027: [...] };
+// 每个年份数组 = 该年**落在周一~周五**的法定节假日（YYYY-MM-DD 升序）；周末天然非交易日，不入表
+export const EXCHANGE_EXTRA_CLOSED = { 2024: ['2024-02-09'] };
+// 交易所额外休市日：A 股休市但当年国务院未列为法定假日（2024 除夕），必须计入否则计数偏多
+export const HOLIDAY_SOURCES = { 2024: { publishedAt, notice? }, ... };
+
+/** 单个自然日的日历信息；非法/不可解析日期 → null（不抛，供探针使用） */
+export function tradingDayInfo(date): {
+  date:string, covered:boolean, weekend:boolean, holiday:boolean,
+  trading:boolean|null        // covered=false → null（未知，绝不冒充可交易/不可交易）
+}|null
+
+/** 是否交易日：非法日期或超出覆盖范围 → 抛 ERR-CALENDAR-001 */
+export function isTradingDay(date): boolean
+
+/** (from, to] 区间内的交易日数：不含 from、含 to；from >= to → 0 */
+export function tradingDaysBetween(from, to): number
+// 非法日期 / 任一端超出覆盖范围 → 抛 ERR-CALENDAR-001（不回退到跳周末近似）
+
+/** date 之后第 n 个交易日（n 为正整数）；date 非法或 n 非正整数 → null */
+export function addTradingDays(date, n): string|null
+// 走查过程一旦越出 CALENDAR_COVERAGE → 抛 ERR-CALENDAR-001（返回 null 只表示"入参不足"，
+// 绝不拿未知年份的日历冒充结果）
+
+/** 某年交易日总数；年份未被覆盖 → 抛 ERR-CALENDAR-001 */
+export function tradingDaysInYear(year): number
+
+/** ≤ date 的最近一个交易日（含当日）；非法/越界 → 抛 ERR-CALENDAR-001 */
+export function lastTradingDayOnOrBefore(date): string
+```
+
+口径：
+- 交易日 = 周一~周五 且 不在 `HOLIDAYS[year]` / `EXCHANGE_EXTRA_CLOSED[year]` 中；
+  **周末调休上班日（如 2/14 周六上班）A 股并不开市**，因此不补为交易日。
+- 日期一律 `YYYY-MM-DD`（允许 `YYYY-MM-DDTHH:mm...`，只取前 10 位；不做时区换算，
+  调用方负责传北京时区自然日）；溢出日（`2026-02-30`）必须拒绝，不得让 `Date` 自动进位。
+- 年度维护：新一年国务院通知发布后，把该年"落在工作日的节假日 + 交易所额外休市日"追加进
+  `HOLIDAYS` / `EXCHANGE_EXTRA_CLOSED`，扩 `CALENDAR_COVERAGE.to` 与 `CALENDAR_VERSION`，
+  并在 `test/calendar.test.js` 补该年度计数用例（含春节/国庆跨假期手算对齐）。
+- 消费方：`risk.hardExitCheck`（短线 5 日硬期限）、`strategies/stable.checkPosition`
+  （时间止损 `holdDays`）、`plan.conditionOrdersFromContracts`（条件单 `validUntil`）、
+  `market.computeStale`（陈旧判定锚定最近交易日：节假日期间不误报 stale；日历未覆盖年份
+  回退"最近工作日"，只高估陈旧、不把旧数据说成新鲜）。
