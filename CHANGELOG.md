@@ -6,6 +6,26 @@
 
 ### Added
 
+- **交易日历（P2，`src/calendar.js` 纯函数）**：内置 2024-01-01~2027-12-31 年度表（法定节假日落在
+  工作日的日期 + 交易所额外休市，如 2024 除夕 2/9；A 股周末调休上班日并不开市，不补为交易日），
+  把"只跳周末"换成真实交易日计时；非法日期（含 `2026-02-30` 溢出日）与越界年份一律
+  `ERR-CALENDAR-001`，**绝不回退到只跳周末**（回退会把春节/国庆算成交易日，硬红线提前砍仓 = 伪造计数）。
+  - `risk.hardExitCheck`（短线 5 日硬红线）改用真实交易日：2026 春节持仓 2/10→2/24 为 4 个交易日
+    （旧口径 11），不会提前砍仓；`risk.tradingDaysBetween` 改为 re-export（唯一实现在 calendar）。
+  - `strategies/stable.checkPosition` 时间止损 `holdDays`：契约未显式给时按 `entry.date → 最后一根
+    bar` 的真实交易日计算（此前工具层恒为 0，时间止损实际从未触发）；拿不到日期 → `null`，不误触发。
+  - `plan.conditionOrdersFromContracts` 的 `validUntil` 用真实交易日；走出覆盖范围 → 有效期留空 +
+    warning `STABLE.CALENDAR_UNCOVERED`（不编造日期、也不整单丢弃）。
+  - `market.computeStale` 锚定最近交易日（`lastTradingDayOnOrBefore`）：国庆期间 9/30 的数据不再被
+    误判陈旧；日历未覆盖年份回退"最近工作日"，只高估陈旧、不把旧数据说成新鲜。
+  - 年度维护流程写入 `docs/interface.md` §11（契约：覆盖率/年度表/错误语义/6 个函数）；
+    `docs/risk.md` §3.4 年度计数表与澄清项 R4 关闭、`docs/strategies.md` 时间止损与硬红线口径、
+    `docs/data-sources.md` stale 判定与实现状态表、`docs/design.md` 目录树同步。
+- **测试** `test/calendar.test.js` 12 例：年度表自洽（只含真实工作日/升序/年份对齐）、年度交易日
+  手算（2024 262−20=242、2025 261−18=243、2026 261−19=242、2027 261−18=243）、跨春节/国庆/清明
+  计数与 +N 交易日手算、2024 除夕特例、溢出日与越界 `ERR-CALENDAR-001`、三条消费链路对齐与越界
+  降级、stale 锚点回归；全量 191 测试全绿
+
 - **条件单导出 CSV（`kb_stable action=export`）**：把已锁定契约（t/s/D）与当前 stable 持仓转成券商
   条件单导入 CSV——每个标的止盈/止损各 1 条（`symbol,side,triggerPrice,orderPrice,qty,validUntil`），
   `triggerPrice = round2(entry.price × (1+t | 1+s))`（与 `checkPosition` 同一舍入口径）、

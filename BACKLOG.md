@@ -31,9 +31,9 @@
 
 ## P2（体验与稳健）
 
-- [~] **交易日历**：`tradingDaysBetween` 现只跳周末；接入节假日表（静态 JSON，每年维护，
-  或东财交易日历接口），5 日硬期限与时间止损的计数必须用真实交易日。
-  （进行中 2026-11-26：`src/calendar.js` 年度表 + 三条消费链路接入 + 12 例测试）
+- [x] **交易日历**：`src/calendar.js` 内置 2024~2027 年度表（法定节假日 + 交易所额外休市如 2024 除夕），
+  5 日硬期限、时间止损、条件单有效期、stale 锚点全部改用真实交易日；越界 `ERR-CALENDAR-001`
+  不回退只跳周末。（2026-11-26 完成，commit c6e2f60；12 例新测试，全量 191 测试全绿）
 - [ ] **分红再投选项**：longTerm `reinvest: true` 时除息现金按除息价折入底仓股数（整手），
   默认仍关闭；补手算对齐测试。
 - [x] **Web GUI 面板（M5，提前完成 2026-11-22）**：client 半区插件——侧栏「跬步量化」入口 + 主区驾驶舱
@@ -62,3 +62,8 @@
   CSV（止盈/止损各 1 条，触发价=round2(entry×(1+t|1+s))、委托价=触发价、数量=持仓、有效期=entry+maxHoldDays
   个交易日），UTF-8 BOM+CRLF+RFC4180，Excel 直开；纯函数 `conditionOrdersFromContracts`/`renderConditionOrdersCsv`，
   无契约/契约不完整/无可导出行诚实报错，不伪造 CSV（2026-11-24，commit b39d1d9，179 测试全绿）
+- [x] P2 交易日历：`src/calendar.js` 纯函数年度表（2024~2027，法定节假日 + 2024 除夕交易所休市，
+  周末调休上班日不算交易日），`risk.hardExitCheck`（短线 5 日）、`stable.checkPosition`（时间止损，
+  此前工具层 holdDays 恒 0 未真正生效）、`plan` 条件单 validUntil、`market.computeStale` 四处接入；
+  非法/溢出日与越界年份一律 ERR-CALENDAR-001，绝不回退"只跳周末"；条件单越界 → 有效期留空 +
+  warning STABLE.CALENDAR_UNCOVERED（2026-11-26，commit c6e2f60，191 测试全绿）
