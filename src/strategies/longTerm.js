@@ -6,7 +6,7 @@
  * 双仓结构：底仓 core（只买不卖）+ 活动仓 float（网格高抛低吸摊薄）。
  */
 import { atrPct } from '../indicators.js';
-import { holdingCost, costToNegativeEta, annualDilutionRate } from '../costs.js';
+import { holdingCost, costToNegativeEta, annualDilutionRate, tradeFee } from '../costs.js';
 import { buildPlan } from '../plan.js';
 
 export const meta = {
@@ -30,6 +30,90 @@ const median = (xs) => {
   const m = Math.floor(s.length / 2);
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 };
+
+const round2 = (x) => Math.round((x + Number.EPSILON) * 100) / 100;
+
+/** 策略默认值（meta.configSchema 的 default 摊平，供纯函数独立调用） */
+const defaultsOf = () => Object.fromEntries(Object.entries(meta.configSchema).map(([k, v]) => [k, v.default]));
+
+/**
+ * 分红再投（纯函数，无网络无时钟）—— design.md §4.4、interface.md §7.1
+ *
+ * 把除息日的现金分红按**除息价**折成底仓股数（整手），默认关闭（reinvest:false）：
+ * 长期象限的目标是把成本压负，现金回收比再投更快见效。
+ *
+ * 除息来源双通道：优先 `bars.at(-1).dividendPerShare`（回测/合成数据自带），
+ * 否则查 `dividends[]` 中 `exDate === bars.at(-1).date`（行情层日K不含分红，实盘走这条）。
+ *
+ * 价格口径：`bar.close`（**未复权**收盘价）。每股分红是未复权口径，用 adjClose 折算会把
+ * 股数算歪（除息后前复权价被压低 → 多算股数 = 伪造成交），因此绝不混用。
+ *
+ * 整手 + 不赊账：qty 从 `floor(cash/price/100)*100` 起逐手递减，直到
+ * `price*qty + tradeFee(buy) ≤ cash`（佣金有 5 元最低，费用买不起时就少买一手）；
+ * 最终 < 1 手 → 不生成指令，返回 rejected（P6 诚实失败，绝不伪造成交）。
+ *
+ * @param {{bars:Array, position:{qty:number}|null, dividends?:Array, config?:object,
+ *          fee?:object}} p
+ * @returns {{enabled:boolean, exDate:string|null, dividendPerShare:number, shares:number,
+ *            cashDividend:number, price:number|null, qty:number, fee:number,
+ *            rejected:{rule:string, reason:string}|null}}
+ */
+export function reinvestPlan({ bars, position, dividends = [], config = {}, fee } = {}) {
+  const cfg = { ...defaultsOf(), ...config };
+  const enabled = cfg.reinvest === true; // 只有显式 true 才开，'false' 字符串不算
+  const last = Array.isArray(bars) && bars.length ? bars[bars.length - 1] : null;
+  const shares = Math.max(0, Math.round(Number(position?.qty) || 0));
+  const idle = { enabled, exDate: null, dividendPerShare: 0, shares, cashDividend: 0, price: null, qty: 0, fee: 0, rejected: null };
+  if (!enabled || !last) return idle;
+
+  // 除息来源 1：最后一根 bar 自带每股分红
+  let dps = Number(last.dividendPerShare) > 0 ? Number(last.dividendPerShare) : 0;
+  let exDate = dps > 0 ? last.date ?? null : null;
+  // 除息来源 2：分红历史上落在最后一根 bar 当天的实施方案
+  if (!(dps > 0) && last.date && Array.isArray(dividends)) {
+    const hit = dividends.find((d) => d && d.exDate === last.date && Number(d.cashPerShare) > 0);
+    if (hit) {
+      dps = Number(hit.cashPerShare);
+      exDate = hit.exDate;
+    }
+  }
+  if (!(dps > 0)) return idle; // 今天不是除息日：本来就没有再投，不是失败
+
+  const cashDividend = round2(dps * shares);
+  const base = { enabled, exDate, dividendPerShare: dps, shares, cashDividend, price: null, qty: 0, fee: 0, rejected: null };
+  if (shares <= 0) {
+    return {
+      ...base,
+      rejected: { rule: 'LONG.REINVEST_NO_POSITION', reason: `除息日 ${exDate} 无底仓持股（position.qty=${shares}）：无股份可分，不产生再投指令` },
+    };
+  }
+  const px = Number(last.close); // 未复权收盘价 = 除息价，绝不取 adjClose
+  if (!(px > 0)) {
+    return {
+      ...base,
+      rejected: { rule: 'LONG.REINVEST_NO_PRICE', reason: '除息日缺少有效未复权收盘价（bar.close）：无法折算股数，不编造' },
+    };
+  }
+
+  // 整手起始量 → 按"含费用买得起"逐手回退（佣金最低 5 元，费用会把最后一手吃掉）
+  let qty = Math.floor(cashDividend / px / 100) * 100;
+  let feeAmount = 0;
+  while (qty >= 100) {
+    feeAmount = tradeFee({ side: 'buy', price: px, qty, fee });
+    if (round2(px * qty) + feeAmount <= cashDividend + 1e-9) break;
+    qty -= 100;
+  }
+  if (qty < 100) {
+    return {
+      ...base,
+      rejected: {
+        rule: 'LONG.REINVEST_TOO_SMALL',
+        reason: `现金分红 ${cashDividend} 元按除息价 ${px} 不足 1 手（含费用）：不生成再投指令，现金留在账上`,
+      },
+    };
+  }
+  return { ...base, price: round2(px), qty, fee: round2(feeAmount) };
+}
 
 /**
  * 网格参数生成（design.md §4.3）
@@ -98,7 +182,9 @@ export function dilutionReport({ bars, dividends = [], lots = [], price, config 
     dividendYield: Math.round(dividendYield * 10000) / 10000,
     annualDilutionRate: r,
     etaYears: eta,
-    note:
+    // 分红再投会改变"已回收现金"的口径：如实回显，ETA 公式本身不为它打折
+    reinvestEnabled: cfg.reinvest === true,
+    note: [
       hc.costPerShare === null
         ? '当前无持仓，先建立底仓再谈摊薄'
         : hc.negative
@@ -106,6 +192,10 @@ export function dilutionReport({ bars, dividends = [], lots = [], price, config 
           : eta === null
             ? '缺少分红史或摊薄率不足，无法给出 ETA —— 诚实拒绝，不编造乐观数字'
             : `当前成本 ${hc.costPerShare}，现价 ${px}，年化摊薄 ${(r * 100).toFixed(1)}%，预计 ${eta} 年成本转负`,
+      cfg.reinvest === true
+        ? '已开启分红再投：分红变成股数、totalRecovered 不增，成本转负进度会慢于该 ETA（想更快拿回本金就关掉 reinvest）'
+        : '',
+    ].filter(Boolean).join('；'),
   };
 }
 
@@ -113,9 +203,11 @@ export function dilutionReport({ bars, dividends = [], lots = [], price, config 
  * 统一 evaluate：根据当前价与网格位置生成次日指令
  * 触发规则（收盘确认、次日执行，P3）：
  *   前收 ≤ P0×(1−g×k) 且未持满 → 买 1 格；前收 ≥ P0×(1+g×k) 且活动仓>0 → 卖 1 格
+ * 分红再投（config.reinvest 默认 false）：除息日把现金折成整手股数，同样次日执行；
+ * 与网格买入同日触发时指令单同向去重（保留网格买入，再投留痕到 rejected）。
  */
-export function evaluate({ bars, position, account, config = {}, symbol }) {
-  const cfg = { ...Object.fromEntries(Object.entries(meta.configSchema).map(([k, v]) => [k, v.default])), ...config };
+export function evaluate({ bars, position, account, config = {}, symbol, dividends = [] }) {
+  const cfg = { ...defaultsOf(), ...config };
   if (!Array.isArray(bars) || bars.length < cfg.baseWindow) {
     return { signals: [], plan: null, diagnostics: { error: `ERR-DATA-002: 需要至少 ${cfg.baseWindow} 根 K 线` } };
   }
@@ -157,9 +249,36 @@ export function evaluate({ bars, position, account, config = {}, symbol }) {
     }
   }
 
+  // 分红再投（默认关闭）：除息日现金 → 整手股数，信号次日执行（P3），不伪造成交
+  const reinvest = reinvestPlan({ bars, position, dividends, config: cfg });
+  if (reinvest.qty >= 100) {
+    const deduped = signals.some((s) => s.action === 'buy');
+    if (deduped) {
+      // 指令单同标的同向去重（plan.js）：保留网格买入，再投必须留痕，绝不静默丢单
+      rejected.push({
+        symbol,
+        rule: 'LONG.REINVEST_DEDUPED',
+        reason: `除息再投 ${reinvest.qty} 股与网格买入同日同向：指令单去重保留网格买入，除息现金 ${reinvest.cashDividend} 元留账上（未下单，未伪造成交）`,
+      });
+    } else {
+      signals.push({
+        mode: 'long', symbol, action: 'buy', qty: reinvest.qty, price: reinvest.price,
+        reason: `LONG.REINVEST：除息 ${reinvest.dividendPerShare}×${reinvest.shares} 股 = 现金 ${reinvest.cashDividend} 元，按除息价 ${reinvest.price} 折 ${reinvest.qty} 股整手（含费 ${reinvest.fee}）`,
+        rule: 'LONG.REINVEST', confidence: 0.95,
+      });
+    }
+  } else if (reinvest.rejected) {
+    rejected.push({ symbol, rule: reinvest.rejected.rule, reason: reinvest.rejected.reason });
+  }
+
+  const footnotes = [gp.note];
+  if (reinvest.enabled) {
+    footnotes.push('分红再投已开启：除息现金折成整手股数（次日执行），totalRecovered 不增，成本转负慢于纯现金回收');
+  }
+
   const plan = buildPlan({
     mode: 'long', asOf: last.date, tradingDay: null, signals, rejected,
-    footnotes: [gp.note],
+    footnotes,
   });
-  return { signals, plan, diagnostics: { grid: gp, gridFull, price: px } };
+  return { signals, plan, diagnostics: { grid: gp, gridFull, price: px, reinvest } };
 }

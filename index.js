@@ -256,12 +256,13 @@ function apply(ctx, config) {
   ctx.tools.register(defineTool({
     name: 'kb_longterm',
     description:
-      '跬步量化·长期象限：高股息底仓+网格摊薄，目标把持仓成本做成负数。action=grid 生成网格参数（基准价/步长/上下格/每格量）；dilution 成本转负 ETA 与分红摊薄模拟；plan 生成次日网格指令单。',
+      '跬步量化·长期象限：高股息底仓+网格摊薄，目标把持仓成本做成负数。action=grid 生成网格参数（基准价/步长/上下格/每格量）；dilution 成本转负 ETA 与分红摊薄模拟；plan 生成次日网格指令单（reinvest=true 时除息现金按除息价折成整手底仓股数，默认关闭）。',
     parameters: {
       action: { type: 'string', required: true, enum: ['grid', 'dilution', 'plan'], description: '操作' },
       symbol: { type: 'string', required: true, description: '标的代码' },
       budget: { type: 'number', description: 'grid：活动仓预算（元），默认按象限现金×quadrantSplit' },
       days: { type: 'integer', description: '取用的日K根数，默认 250' },
+      reinvest: { type: 'boolean', description: 'plan：是否开启分红再投（默认 false——现金回收比再投更快把成本压负）' },
     },
     output: TEXT_OUTPUT,
     async execute(args) {
@@ -269,12 +270,13 @@ function apply(ctx, config) {
         const strat = await tryImport('./src/strategies/index.js');
         if (!strat || !strat.registry || !strat.registry.long) return moduleMissing('长期策略', './src/strategies/index.js');
         const long = strat.registry.long;
+        const reinvest = args.reinvest === true; // 只有显式 true 才开，字符串 'false' 不算
         if (!args.symbol) return { ok: false, code: 'ERR-SYMBOL-001', message: '需要 symbol' };
         const barsRes = await dailyBars(args.symbol, { days: args.days || 250, adjust, timeoutMs });
         const bars = barsRes.bars;
         if (args.action === 'grid') {
           if (typeof long.gridPlan !== 'function') return moduleMissing('gridPlan', './src/strategies/longTerm.js');
-          const plan = long.gridPlan({ bars, budget: args.budget, config: {} });
+          const plan = long.gridPlan({ bars, budget: args.budget, config: { reinvest } });
           return { ok: true, symbol: barsRes.symbol, asOf: barsRes.asOf, stale: barsRes.stale, ...plan, footnotes: [DISCLAIMER] };
         }
         if (args.action === 'dilution') {
@@ -282,13 +284,20 @@ function apply(ctx, config) {
           const div = await dividends(args.symbol, { timeoutMs }).catch(() => ({ items: [] }));
           const ledgerMod = await tryImport('./src/ledger.js');
           const lots = ledgerMod && ledgerMod.makeLedger ? ledgerMod.makeLedger(dataDir).trades('long').filter((t) => t.symbol === args.symbol) : [];
-          const rep = long.dilutionReport({ bars, dividends: div.items, lots, config: {} });
+          const rep = long.dilutionReport({ bars, dividends: div.items, lots, config: { reinvest } });
           return { ok: true, symbol: barsRes.symbol, asOf: barsRes.asOf, ...rep, footnotes: [DISCLAIMER] };
         }
         if (args.action === 'plan') {
           if (typeof long.evaluate !== 'function') return moduleMissing('long.evaluate', './src/strategies/longTerm.js');
-          const res = long.evaluate({ bars, position: null, account: null, config: {}, indexBars: null, stats: null });
-          return { ok: true, symbol: barsRes.symbol, asOf: barsRes.asOf, stale: barsRes.stale, ...res, footnotes: [DISCLAIMER] };
+          // 持仓与分红历史必须由工具层喂进来：行情层日K恒无 dividendPerShare（market.js 为避免
+          // 重复计入），不传 dividends 则分红再投永远无法触发；不传 position 则网格卖出也不会生成。
+          const ledgerMod = await tryImport('./src/ledger.js');
+          const position = ledgerMod && ledgerMod.makeLedger
+            ? (ledgerMod.makeLedger(dataDir).positions('long') || []).find((p) => p.symbol === args.symbol) || null
+            : null;
+          const div = reinvest ? await dividends(args.symbol, { timeoutMs }).catch(() => ({ items: [], warnings: ['DIVIDENDS_UNAVAILABLE'] })) : { items: [] };
+          const res = long.evaluate({ bars, position, account: null, config: { reinvest }, indexBars: null, stats: null, dividends: div.items });
+          return { ok: true, symbol: barsRes.symbol, asOf: barsRes.asOf, stale: barsRes.stale, ...res, reinvest: res.diagnostics?.reinvest ?? null, warnings: div.warnings ?? [], footnotes: [DISCLAIMER] };
         }
         return { ok: false, code: 'ERR-INTERNAL', message: `未知 action: ${args.action}` };
       } catch (e) {

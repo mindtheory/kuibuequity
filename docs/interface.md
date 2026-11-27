@@ -343,10 +343,13 @@ export function renderConditionOrdersCsv(orders, { bom = true } = {}): string
 
 ```js
 export const meta = { mode, name, horizon, description, configSchema }
-export function evaluate({ bars, position, account, config, indexBars, stats }): {
+export function evaluate({ bars, position, account, config, indexBars, stats, dividends }): {
   signals: Signal[], plan: OrderPlan|null, diagnostics: object }
 export function simulate?({ bars, config }): { metrics: object, trades: Trade[] }  // 可选
 ```
+
+`evaluate` 的 `dividends`（可选）为 `market.dividends()` 的 `items`（`[{exDate, cashPerShare, ...}]`）：
+仅长期象限消费（分红再投，见 §7.1），其余策略忽略；不传不影响既有行为。
 
 ### 7.1 `longTerm.js` 专有导出
 ```js
@@ -355,8 +358,41 @@ export function gridPlan({ bars, budget, config }): {
   grids: [{ level, price, side, qty }] }
 export function dilutionReport({ bars, dividends, lots, config }): {
   costPerShare, price, dividendYield, annualDilutionRate,
-  etaYears:number|null, progress, note }
+  etaYears:number|null, progress, note, reinvestEnabled:boolean }
+/**
+ * 分红再投（纯函数，无网络无时钟）：把除息日现金按除息价折成底仓股数（整手）。
+ *
+ * 除息来源双通道（按序）：
+ *   1) bars.at(-1).dividendPerShare > 0 —— 回测/合成数据自带每股分红；
+ *   2) dividends[] 中 exDate === bars.at(-1).date 且 cashPerShare > 0 —— 行情层日K
+ *      不含分红（market.js 恒置 0），实盘必须走这条。
+ *
+ * 口径（写死在实现里，测试逐项手算对齐）：
+ *   shares        = position.qty（除息日当时持股数，即上一交易日收盘持股）
+ *   cashDividend  = round2(dividendPerShare × shares)
+ *   price         = bars.at(-1).close（**未复权**收盘价：每股分红是未复权口径，
+ *                   用 adjClose 折算会把股数算歪，绝不混用）
+ *   qty           = 从 floor(cashDividend / price / 100) × 100 起逐手递减，直到
+ *                   price × qty + tradeFee(buy) ≤ cashDividend（费用买不起就少买，不赊账）
+ *   最终 qty < 100 → 不生成指令、进 rejected（整手是硬约束，不伪造成交）
+ *
+ * @returns {{ enabled:boolean, exDate:string|null, dividendPerShare:number, shares:number,
+ *   cashDividend:number, price:number|null, qty:number, fee:number,
+ *   rejected:{rule:string, reason:string}|null }}
+ * rule 码：LONG.REINVEST_NO_POSITION / LONG.REINVEST_NO_PRICE / LONG.REINVEST_TOO_SMALL
+ * enabled=false（默认）时不产生任何决策，rejected 恒为 null（无除息日也恒为 null）。
+ */
+export function reinvestPlan({ bars, position, dividends, config, fee }): object
 ```
+
+**evaluate 内的分红再投（`config.reinvest: true`）**：`reinvestPlan` 产出 `qty ≥ 100` 时追加一条
+`action:'buy'`、`rule:'LONG.REINVEST'` 的信号（信号收盘确认、次日成交，守住 P3）。指令单对同标的同向
+去重（`plan.js`）：若当日网格买入与再投同时触发，**保留网格买入**，再投进 `plan.rejected` 且
+`rule:'LONG.REINVEST_DEDUPED'`（不静默丢单，也不伪造第二笔成交）。`evaluate().diagnostics.reinvest`
+始终带出 `reinvestPlan()` 结果，便于模型解释"为什么没有再投"。
+
+**`dilutionReport` 与再投的关系**：`reinvestEnabled` 回显 `config.reinvest`；开启时 `note` 追加提示
+"分红再投不增加 totalRecovered，成本转负进度会慢于该 ETA"——不改 ETA 公式，只如实提醒。
 
 ### 7.2 `stable.js` 专有导出
 ```js

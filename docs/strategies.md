@@ -103,11 +103,21 @@ LONG.ADD:
           P0 = trigger_k                # 锚定跟随：成交后重置基准价
           break                          # 每次只补最深未成交的一格
 
-  # 分红再投（默认关闭）
-  if config.reinvest and bars.last.dividendPerShare > 0:
-      qty = floor(cashDividendReceived / bars.last.close / 100) * 100
-      if qty >= 100: emit Signal(buy, qty, rule='LONG.REINVEST')
+  # 分红再投（默认关闭；已实现 src/strategies/longTerm.js#reinvestPlan，见 interface.md §7.1）
+  dps = bars.last.dividendPerShare                 # 通道 1：回测/合成数据自带
+  if dps <= 0:                                     # 通道 2：行情层日K不含分红，查分红历史
+      dps = dividends[exDate == bars.last.date].cashPerShare
+  if config.reinvest and dps > 0:
+      cash = round2(dps * position.qty)            # 除息日当时持股数
+      qty  = floor(cash / bars.last.close / 100) * 100   # 除息价用**未复权** close
+      while qty >= 100 and bars.last.close*qty + tradeFee(buy) > cash: qty -= 100  # 不赊账
+      if qty >= 100: emit Signal(buy, qty, price=bars.last.close, rule='LONG.REINVEST')
+      else: rejected('LONG.REINVEST_TOO_SMALL')    # 不足 1 手不伪造成交
 ```
+
+> **为什么除息价必须用未复权 close**：每股分红是未复权口径；用前复权价折算会让股数凭空变多，
+> 等于伪造一笔买不到（也买不起）的成交。**为什么要求"含费用买得起"**：佣金 5 元起步，
+> 分红现金常常刚好差那几元，少买一手才是真实可执行的指令。
 
 > **为什么成交后重置 P0**：不重置则下跌途中格子间距被拉大，越跌越买不到；
 > 重置后网格跟随价格中枢，代价是单边下跌时更快触达"网格打满"熔断——这正是我们想要的信号。
@@ -161,7 +171,7 @@ LONG.EXIT:
 | `gridsPerSide` (N) | 5 | 3～8 | N 越大越抗跌但每格资金越小，N×q×P0 必须 ≤ 活动仓预算 |
 | `stepFactor` | 1.2 | 0.8～2.0 | `g = clamp(ATR20% × stepFactor, 3%, 8%)`；调大→成交更少、单格毛利更高 |
 | `g`（派生） | 3%～8% | 硬夹逼 [0.03, 0.08] | 低于 3% 会被费用吃掉（见 §1.4 例：单格净收益 5.94%） |
-| `reinvest` | false | true/false | 目标是成本转负 → 现金回收更快；只有"复利滚存"诉求时才开 |
+| `reinvest` | false | true/false | 目标是成本转负 → 现金回收更快；只有"复利滚存"诉求时才开。已实现：除息现金按未复权 close 折整手股数（含费买不起就少买一手），不足 1 手进 rejected |
 | `maxSymbolPct` | 0.40 | 0.20～0.40 | **只可下调**，上调属硬红线放宽，需 override + 审计 |
 | `maxQuadrantPct` | 0.70 | 0.40～0.70 | 同上 |
 | `gridAnnualGross` | 0.15 | 0.05～0.25 | ETA 输入，必须用回测/实盘校准，不许拍脑袋 |
@@ -769,7 +779,7 @@ qty = floor(10,000 / 12.30 / 100) × 100 = floor(8.13) × 100 = 800 股
 | :-- | :-- | :-- |
 | `holdingCost` / `costToNegativeEta` / `annualDilutionRate` | interface.md §1 | 已有骨架（`src/costs.js`） |
 | `RED_LINES` / `gate` / `expectancyCheck` / `sentimentGate` | interface.md §5 | 已有骨架（`src/risk.js`）；**象限仓位上限检查为计划** |
-| `gridPlan` / `dilutionReport` | interface.md §7.1 | 计划（`src/strategies/longTerm.js` 进行中） |
+| `gridPlan` / `dilutionReport` / `reinvestPlan` | interface.md §7.1 | ✅ 已实现（`src/strategies/longTerm.js`；分红再投默认关闭，整手 + 含费可负担，除息价用未复权 close） |
 | `adaptiveTarget` / `checkPosition` | interface.md §7.2 | 计划 |
 | `scoreCandidates` / `exitPlan` | interface.md §7.3 | 计划 |
 | 回测引擎（T+1/涨跌停/整手/分红） | interface.md §8 | 计划 |
