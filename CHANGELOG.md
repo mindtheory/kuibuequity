@@ -6,6 +6,30 @@
 
 ### Added
 
+- **分红再投（P2，`src/strategies/longTerm.js#reinvestPlan` 纯函数）**：`config.reinvest` 开启时把除息日
+  现金分红按**除息价**折成底仓股数（整手），默认关闭（现金回收比再投更快把成本压负）。
+  - 除息来源双通道：`bars.at(-1).dividendPerShare`（回测/合成数据）→ `dividends[]` 中
+    `exDate === 最后一根 bar` 的实施方案。行情层日K恒无分红（`market.js` 为避免重复计入），
+    所以**实盘只走第二条**——`kb_longterm action=plan` 现在会读账本持仓并拉分红历史
+    （此前 `position` 恒为 `null`、无 dividends，再投与网格卖出在实盘都不可能触发）。
+  - 价格口径：除息价一律取**未复权 `bar.close`**；用 `adjClose` 折算会把股数算多
+    （例：close=6.00/adjClose=5.00、现金 3000 元 → 正确 400 股，误用 600 股），等于伪造成交。
+  - 整手 + 不赊账：`qty` 从 `floor(cash/price/100)*100` 起逐手回退，直到
+    `price×qty + tradeFee(buy) ≤ cash`（佣金 5 元起步，费用会把最后一手吃掉）；
+    最终 < 1 手 → 不生成指令，进 `rejected` `LONG.REINVEST_TOO_SMALL`，现金留账上。
+  - `evaluate` 同日网格买入与再投同为买入 → 指令单同向去重**保留网格买入**，再投留痕
+    `LONG.REINVEST_DEDUPED`（不静默丢单，也不伪造第二笔成交）；`diagnostics.reinvest` 恒带出明细。
+  - `dilutionReport` 新增 `reinvestEnabled`，开启时 `note` 追加"再投不增加 totalRecovered、
+    成本转负慢于该 ETA"——ETA 公式不为再投打折，只如实提醒。
+- **工具面**：`kb_longterm` 新增 `reinvest` 参数（默认 false），`action=grid/dilution/plan` 全部透传。
+- **测试** `test/reinvest.test.js` 15 例：手算对齐（0.6×5000=3000 元，除息价 5.80 → 500 股、费 5.03
+  = 佣金 5 + 过户 0.029；除息价 6.00 → 含费回退 400 股）、费用吃掉最后一手（1000 元/10.00 → 0 股）、
+  未复权 vs 前复权 400≠600、
+  无持仓/缺价/非除息日/分红历史通道、evaluate 集成与同日去重留痕、dilutionReport 提示不动 ETA；
+  全量 206 测试全绿
+- 文档：`docs/interface.md` §7/§7.1（`reinvestPlan` 签名、口径、4 个 rule 码）、
+  `docs/strategies.md` §1.2(b) 伪代码与 §5 实现状态同步
+
 - **交易日历（P2，`src/calendar.js` 纯函数）**：内置 2024-01-01~2027-12-31 年度表（法定节假日落在
   工作日的日期 + 交易所额外休市，如 2024 除夕 2/9；A 股周末调休上班日并不开市，不补为交易日），
   把"只跳周末"换成真实交易日计时；非法日期（含 `2026-02-30` 溢出日）与越界年份一律
