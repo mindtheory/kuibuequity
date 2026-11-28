@@ -6,6 +6,33 @@
 
 ### Added
 
+- **复盘增强（P2，`src/review.js#reviewReport` 纯函数）**：`kb_review` 与 `/api/kuibuequity/review`
+  改为共用同一套口径（此前两处各写一套 `new Date()` 日期过滤，窗口会漂移），`asOf` 显式传入
+  便于事后对账，工具新增可选 `asOf` 参数。
+  - **按象限纪律遵守率**：分母 = 期内有效锁定契约数（`createdAt` 在期内，或期前契约但期内有
+    override —— 说明它当期仍在被改），分子 = 期内 override 次数，
+    `rate = max(0, 1 − override/契约数)`。同一契约被改 3 次 = 3 次违反 / 1 次机会 →
+    遵守率夹 0、`capped:true`、`overrideRate` 如实给 3 并记 `REVIEW.OVERRIDE_EXCEEDS_CONTRACTS`
+    （**不把多次 override 稀释成"只违规一次"**）；期内无契约 → `null`，不输出假的 100%
+    （"0 次违规"与"没有机会违规"不是一回事）。
+  - **短线超期未离场清单**：`holdDays = tradingDaysBetween(openDate, asOf)`（真实交易日，非"跳周末"），
+    `dueDate = addTradingDays(openDate, 5)`，`mustExitNow = holdDays >= 5`（与 `risk.hardExitCheck`
+    同口径），`overdue` 只在 `holdDays > 5` 成立。第 5 个交易日进 `dueToday`（今天必须走，还不算
+    违规），`>5` 才进 `items` —— 既不把"到期"记成"已违规"，也不放过真超期。
+  - **诚实失败**：`asOf` 非法/溢出日、任一短线持仓 `openDate` 缺失/非法/超出日历覆盖 →
+    `ERR-CALENDAR-001`（5 日硬期限无法核验时不产出看起来正常的复盘）；`period`/`quadrant` 非法 →
+    `ERR-REVIEW-001`；缺日期记录计入并记 `REVIEW.MISSING_DATE`，晚于 `asOf` 的记录排除并记
+    `REVIEW.RECORD_AFTER_ASOF`。无短线持仓时不触碰日历（断网、跨年可复盘）。
+  - 文档：`docs/interface.md` 新增 §12（签名/口径/warnings 码）与 §10 `ERR-REVIEW-001`；
+    `docs/risk.md` §6.2 遵守率口径指向 §12；`docs/design.md` 工具表、`README.md`、
+    `docs/strategies.md` §5 实现状态同步。
+- **测试** `test/review.test.js` 17 例 + `test/plugin.test.js` 2 例集成通路自检：周期起点手算
+  （week 2026-11-28→11-21；month 2026-03-31→02-28 月末夹取；all→null）、override 3 次不稀释、
+  期外契约剔除而期前契约因期内 override 计入、三象限隔离、短线 11/20 建仓 asOf 11/30 逐日手算
+  （11/23、24、25、26、27、30 = 6 日 → 超期 1 日、应离场 11/27）、第 5 日 `dueToday`、
+  无短线持仓时 2028 越界仍可复盘、非法 asOf/period/quadrant 与 openDate 越界硬失败；
+  全量 225 测试全绿。
+
 - **分红再投（P2，`src/strategies/longTerm.js#reinvestPlan` 纯函数）**：`config.reinvest` 开启时把除息日
   现金分红按**除息价**折成底仓股数（整手），默认关闭（现金回收比再投更快把成本压负）。
   - 除息来源双通道：`bars.at(-1).dividendPerShare`（回测/合成数据）→ `dividends[]` 中

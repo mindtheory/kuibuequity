@@ -39,8 +39,9 @@
 - [x] **Web GUI 面板（M5，提前完成 2026-11-22）**：client 半区插件——侧栏「跬步量化」入口 + 主区驾驶舱
   （总览/持仓/指令单/个股体检/复盘 五 Tab，情绪总闸灯、成本转负进度条、条件单 CSV 导出、象限建账入口）。
   节点侧 `/api/kuibuequity/*` 8 路由 + loopback 守卫；3099 自检实例端到端验证通过。详见 docs/web-panel.md。
-- [ ] **kb_review 增强**：按象限输出纪律遵守率（契约 override 次数 / 应触发次数）、
-  短线超期未离场检测（持仓 >5 交易日清单）。
+- [x] **kb_review 增强**：按象限输出纪律遵守率（契约 override 次数 / 应触发次数）、
+  短线超期未离场检测（持仓 >5 交易日清单）。（2026-11-28 完成，commit 3db38bc；17+2 例新测试，
+  全量 225 测试全绿）
 
 ## P3（远期，需老板拍板后才做）
 
@@ -74,3 +75,10 @@
   此前工具层 holdDays 恒 0 未真正生效）、`plan` 条件单 validUntil、`market.computeStale` 四处接入；
   非法/溢出日与越界年份一律 ERR-CALENDAR-001，绝不回退"只跳周末"；条件单越界 → 有效期留空 +
   warning STABLE.CALENDAR_UNCOVERED（2026-11-26，commit c6e2f60，191 测试全绿）
+- [x] P2 kb_review 增强：抽取纯函数 `src/review.js#reviewReport`（asOf 显式传入，无时钟），
+  kb_review 工具与 `/api/kuibuequity/review` 共用一套口径；纪律遵守率按象限输出
+  （分母=期内有效锁定契约数、分子=期内 override 次数；同一契约多次 override 不稀释，
+  夹 0 + capped + overrideRate 如实；无契约输出 null 而非 100%）；短线超期未离场清单
+  （真实交易日 holdDays、dueDate=第 5 个交易日，holdDays=5 进 dueToday、>5 才进 items）；
+  越界/非法 asOf 与短线 openDate 无法核验 → ERR-CALENDAR-001 硬失败，period/quadrant 非法 →
+  ERR-REVIEW-001（2026-11-28，commit 3db38bc，225 测试全绿）
