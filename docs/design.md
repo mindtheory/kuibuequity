@@ -389,7 +389,7 @@ T+1 卖出规则下最早次日可卖：
 | `kb_short` | 短线：候选池打分、离场提醒、情绪总闸状态 | `action`, `topN` |
 | `kb_backtest` | 统一回测（指定象限 + 标的 + 区间） | `mode`, `symbol`, `from`, `to` |
 | `kb_risk` | 风控闸门与红线查询、override 申请与审计 | `action` |
-| `kb_review` | 周/月复盘：胜率、盈亏比、override 清单、纪律遵守率 | `period` |
+| `kb_review` | 周/月复盘：胜率、盈亏比、override 清单、**按象限纪律遵守率**、**短线超期未离场清单** | `period`, `quadrant`, `asOf` |
 
 工具全部返回结构化 JSON + 人类可读摘要；所有写操作幂等（`idempotencyKey`）。
 

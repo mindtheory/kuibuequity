@@ -783,5 +783,6 @@ qty = floor(10,000 / 12.30 / 100) × 100 = floor(8.13) × 100 = 800 股
 | `adaptiveTarget` / `checkPosition` | interface.md §7.2 | 计划 |
 | `scoreCandidates` / `exitPlan` | interface.md §7.3 | 计划 |
 | 回测引擎（T+1/涨跌停/整手/分红） | interface.md §8 | 计划 |
+| `reviewReport`（按象限纪律遵守率 + 短线超期未离场） | interface.md §12 | ✅ 已实现（`src/review.js`；override 次数不稀释、无契约输出 null、硬期限无法核验直接 `ERR-CALENDAR-001`） |
 
 > 上表随实现推进需同步更新；文档不得先于代码宣称"已实现"。

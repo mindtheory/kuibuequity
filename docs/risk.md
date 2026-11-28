@@ -362,8 +362,10 @@ overrideContract({ contractId, patch, reason }):
 | `mode` / `symbol` | string | 便于复盘过滤（计划补充字段） |
 | `actor` | string | 固定 `user`（插件永不自动 override） |
 
-复盘（`kb_review`）必须输出：**override 清单**（逐条 before→after + 理由）与**纪律遵守率**
-（= 未 override 且按指令单执行的笔数 / 总笔数）。
+复盘（`kb_review`）必须输出：**override 清单**（逐条 before→after + 理由）与**纪律遵守率**。
+遵守率口径唯一事实源见 `interface.md` §12：分母 = 期内有效的锁定契约数（应遵守/应触发次数），
+分子 = 期内 override 次数，`rate = max(0, 1 − override/契约数)`；同一契约被多次 override 不稀释
+（`overrideRate` 如实 >1 并置 `capped`）；期内无契约输出 `null` 而非 100%。
 
 ---
 

@@ -183,3 +183,38 @@ test('kb_stable export：无可导出标的 → ERR-EXPORT-001（诚实失败，
   assert.equal(r.csv, undefined, '失败时不得返回 CSV');
   assert.ok(Array.isArray(r.warnings));
 });
+
+// ---- kb_review 增强的集成通路自检：工具层必须把账本持仓喂进纯函数 ----
+// （历史教训：pure function 测试全绿、工具层却恒传 null，功能实盘"通路断了"）
+
+test('kb_review：纪律遵守率按象限输出（工具层与纯函数同口径，asOf 显式传入）', async () => {
+  const asOf = new Date().toISOString().slice(0, 10); // 建仓契约 createdAt 即"现在"，保证在期内
+  const r = await call('kb_review', { period: 'all', asOf });
+  assert.equal(r.ok, true);
+  assert.equal(r.asOfKind, 'reviewedAt');
+  assert.equal(r.periodEnd, asOf);
+  const st = r.discipline.byQuadrant.stable;
+  assert.equal(st.contractsChecked, 1, '600036 建仓契约应计入应遵守次数');
+  assert.equal(st.overrideCount, 0);
+  assert.equal(st.disciplineRate, 1);
+  assert.equal(r.discipline.byQuadrant.short.contractsChecked, 0, 'short 无契约 → null 而非 100%');
+  assert.equal(r.discipline.byQuadrant.short.disciplineRate, null);
+  assert.ok(r.footnotes.some((f) => f.includes('不构成任何投资建议')));
+});
+
+test('kb_review：短线持仓 >5 交易日进入超期清单（账本 openDate → 纯函数）', async () => {
+  await call('kb_account', { action: 'init', quadrant: 'short', cash: 100000, totalAsset: 100000 });
+  const buy = await call('kb_account', {
+    action: 'trade', quadrant: 'short', symbol: '600001', side: 'buy', price: 10, qty: 1000, date: '2026-11-20',
+  });
+  assert.equal(buy.ok, true);
+  // 2026-11-23、24、25、26、27、30 = 6 个交易日 → 超期 1 日，应离场日 11/27
+  const r = await call('kb_review', { period: 'all', asOf: '2026-11-30' });
+  assert.equal(r.ok, true);
+  assert.equal(r.shortOverdue.count, 1);
+  assert.equal(r.shortOverdue.items[0].symbol, '600001');
+  assert.equal(r.shortOverdue.items[0].holdDays, 6);
+  assert.equal(r.shortOverdue.items[0].overdueDays, 1);
+  assert.equal(r.shortOverdue.items[0].dueDate, '2026-11-27');
+  assert.ok(r.disciplineNote.includes('短线超期未离场 1 只'));
+});

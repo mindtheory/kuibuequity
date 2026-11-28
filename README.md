@@ -60,7 +60,7 @@ dsh --patch ./cordis.patch.yml --profile web   # 覆盖层热加载
 | `kb_short` | 短线：候选池打分、离场提醒、情绪总闸状态 |
 | `kb_backtest` | 统一回测（无未来函数 / T+1 / 整手 / 涨跌停 / 费用） |
 | `kb_risk` | 风控闸门、红线查询、override 申请与审计 |
-| `kb_review` | 周/月复盘：胜率、盈亏比、override 清单、纪律遵守率 |
+| `kb_review` | 周/月复盘：胜率、盈亏比、override 清单、按象限纪律遵守率、短线超期未离场清单 |
 
 ## 设计文档
 

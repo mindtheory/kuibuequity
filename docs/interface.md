@@ -492,6 +492,7 @@ export function apply(ctx, config) { ctx.tools.register(defineTool({...})) ... }
 | `ERR-CONTRACT-001` | 契约锁定，修改需 override + reason |
 | `ERR-OVERRIDE-001` | 硬红线不可 override（短线 5 日强制离场） |
 | `ERR-CALENDAR-001` | 交易日历不支持该日期（非法日期 / 超出内置覆盖范围），禁止回退到"只跳周末" |
+| `ERR-REVIEW-001` | 复盘入参非法（`period` 不在 week/month/all，或 `quadrant` 不是三象限之一） |
 
 ---
 
@@ -546,3 +547,75 @@ export function lastTradingDayOnOrBefore(date): string
   （时间止损 `holdDays`）、`plan.conditionOrdersFromContracts`（条件单 `validUntil`）、
   `market.computeStale`（陈旧判定锚定最近交易日：节假日期间不误报 stale；日历未覆盖年份
   回退"最近工作日"，只高估陈旧、不把旧数据说成新鲜）。
+
+---
+
+## 12. `src/review.js` — 复盘统计（纯函数）
+
+> 唯一事实源：**纪律遵守率**与**短线超期未离场**的口径。实现不得在工具层另立一套统计：
+> `index.js#kb_review` 与 `/api/kuibuequity/review` 必须共用本模块（同一份口径，两个入口）。
+
+```js
+export const REVIEW_PERIODS = ['week', 'month', 'all'];
+export const SHORT_HARD_MAX_HOLD_DAYS = 5;
+
+export function reviewReport({ trades, contracts, positions, period = 'week', quadrant, asOf }): {
+  period, periodStart:string|null, periodEnd:string,
+  asOf:string, asOfKind:'reviewedAt', quadrant:string,
+  trades:number, winRate:number|null, payoffRatio:number|null, maxDrawdown:number|null,
+  overrides: Array<{ contractId, quadrant, symbol, at, patch, reason }>,
+  discipline: {
+    overall: DisciplineStat,
+    byQuadrant: Record<'long'|'stable'|'short', DisciplineStat>   // 传 quadrant 时只含该象限
+  },
+  shortOverdue: {
+    maxHoldDays:5, checked:number, count:number,
+    items:   Array<{ quadrant:'short', symbol, qty, openDate, holdDays, dueDate,
+                     overdueDays, mustExitNow:true, note }>,     // 持仓 >5 交易日（真超期）
+    dueToday:Array<{ ...同上, overdueDays:0 }>                   // 第 5 个交易日当天，必须走
+  },
+  warnings: string[],
+  disciplineNote: string
+}
+
+// DisciplineStat
+{
+  quadrant: 'long'|'stable'|'short'|'all',
+  contractsChecked:number,     // 应遵守/应触发次数（分母）：期内有效的锁定契约数
+  overrideCount:number,        // 期内 override 次数（分子）
+  overriddenContracts:number,
+  cleanContracts:number,
+  disciplineRate:number|null,  // max(0, 1 - overrideCount/contractsChecked)，0~1；无契约 → null
+  overrideRate:number|null,    // overrideCount/contractsChecked，可 >1 且不夹（如实暴露）
+  capped:boolean               // overrideCount > contractsChecked → 遵守率按 0 计
+}
+```
+
+口径（写死在实现里，测试逐项手算对齐）：
+
+- **周期**：`week` = asOf 往前 7 个自然日（`periodStart = asOf − 7 天`）；`month` = asOf 往前 1 个
+  自然月（月末夹取：`2026-03-31` → `2026-02-28`，不得靠 `Date` 自动进位成 3 月）；`all` = 不限起点。
+- **归属日期**取字符串前 10 位，**不做时区换算**（调用方负责传北京时区自然日）；溢出日
+  （`2026-02-30`）按"缺日期"处理并记 `REVIEW.MISSING_DATE`。
+- 记录缺日期 → **计入**统计并记 warning（不静默丢弃，也不假装它在别的日期）；记录日期 > `asOf` →
+  排除并记 `REVIEW.RECORD_AFTER_ASOF`（未来数据不能污染本期）。
+- **纪律遵守率分母** = 期内有效的锁定契约数（每个契约算 1 次"本应遵守"的机会）：契约
+  `createdAt` 落在期内，或 `createdAt` 在期前但期内有 override（说明它当期仍在被改）。
+- **分子** = 期内 override 次数（`contract.overrides[].at` 落在期内）。同一契约被改 3 次 = 3 次违反 /
+  1 次机会 → `disciplineRate` 夹到 0 且 `capped:true`、warning `REVIEW.OVERRIDE_EXCEEDS_CONTRACTS`，
+  同时 `overrideRate` 如实给 3（**不夹**）——绝不把多次 override 稀释成"只违规一次"。
+- 期内无契约时 `disciplineRate`/`overrideRate` 为 `null`（"0 次违规"与"没有机会违规"不是一回事，
+  不得输出 100%）。
+- **短线超期未离场**：取 `positions` 中 `quadrant==='short'` 且 `qty>0` 的持仓，
+  `holdDays = tradingDaysBetween(openDate, asOf)`（真实交易日，见 §11）、
+  `dueDate = addTradingDays(openDate, 5)`（第 5 个交易日，当日收盘前必须清仓）、
+  `mustExitNow = holdDays >= 5`（与 `risk.hardExitCheck` 同口径）、
+  `overdue = holdDays > 5`（第 5 日没走成才是超期，`overdueDays = holdDays − 5`）。
+  只有 `overdue` 进 `items`（清单 = 持仓 >5 交易日）；`holdDays === 5` 进 `dueToday`（今天必须走，
+  还不算超期）——两者分开，既不把"到期"记成"已违规"，也不放过真超期。
+- **诚实失败（P6）**：`asOf` 非法/溢出 → `ERR-CALENDAR-001`；`period`/`quadrant` 非法 →
+  `ERR-REVIEW-001`；任一短线持仓 `openDate` 缺失、非法或超出日历覆盖 → `ERR-CALENDAR-001`
+  （5 日硬期限无法核验时**不产出**一份看起来正常的复盘，宁可直接失败）。
+- 无短线持仓时不触碰日历：周期统计不需要日历，断网与跨年都可用。
+
+warnings 码表：`REVIEW.MISSING_DATE` / `REVIEW.RECORD_AFTER_ASOF` / `REVIEW.OVERRIDE_EXCEEDS_CONTRACTS`。

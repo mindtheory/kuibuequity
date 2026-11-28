@@ -8,7 +8,7 @@
 import { quote, dailyBars, indexBars } from './market.js';
 import { sentimentGate, hardExitCheck } from './risk.js';
 import { tradeFee } from './costs.js';
-import { winRate, payoffRatio } from './indicators.js';
+import { reviewReport } from './review.js';
 
 function writeJson(res, code, value) {
   const body = JSON.stringify(value);
@@ -180,19 +180,18 @@ export function registerWebRoutes({ ctx, config, dataDir, fee, timeoutMs, adjust
         const url = new URL(req.url, 'http://x');
         const period = url.searchParams.get('period') || 'week';
         const quadrant = url.searchParams.get('quadrant') || undefined;
+        const asOf = url.searchParams.get('asOf') || new Date().toISOString().slice(0, 10);
         const ledger = await getLedger();
-        const cutoff = new Date();
-        if (period === 'week') cutoff.setDate(cutoff.getDate() - 7);
-        else if (period === 'month') cutoff.setMonth(cutoff.getMonth() - 1);
-        const inPeriod = (d) => !d || period === 'all' || new Date(d) >= cutoff;
-        const trades = (ledger.trades(quadrant) || []).filter((t) => inPeriod(t.date));
-        const closed = trades.filter((t) => typeof t.pnl === 'number');
-        const overrides = (ledger.contracts() || []).flatMap((c) => (c.overrides || []).filter((o) => inPeriod(o.at)).map((o) => ({ contractId: c.id, symbol: c.symbol, ...o })));
-        writeJson(res, 200, {
-          ok: true, period, quadrant: quadrant || 'all', trades: trades.length,
-          winRate: winRate(closed), payoffRatio: payoffRatio(closed), overrides,
-          disciplineNote: overrides.length ? `本期 ${overrides.length} 次 override，逐条核对理由` : '本期无 override，纪律遵守',
+        // 与 kb_review 共用同一份纯函数口径（docs/interface.md §12），不在路由里另算一套
+        const report = reviewReport({
+          trades: ledger.trades(),
+          contracts: ledger.contracts(),
+          positions: ledger.positions(),
+          period,
+          quadrant,
+          asOf,
         });
+        writeJson(res, 200, { ok: true, ...report });
       }),
     }));
 

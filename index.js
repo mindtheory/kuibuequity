@@ -15,7 +15,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools';
 import { quote, dailyBars, dividends, indexBars, listStocks, limitUpPool } from './src/market.js';
 import { RED_LINES, gate, expectancyCheck, sentimentGate, hardExitCheck } from './src/risk.js';
 import { resolveFee, tradeFee } from './src/costs.js';
-import { winRate, payoffRatio, maxDrawdown } from './src/indicators.js';
+import { reviewReport } from './src/review.js';
 import { registerWebRoutes } from './src/webapi.js';
 
 const name = 'kuibuequity';
@@ -647,10 +647,11 @@ function apply(ctx, config) {
   ctx.tools.register(defineTool({
     name: 'kb_review',
     description:
-      '跬步量化·复盘：按周期统计胜率、盈亏比、最大回撤、override 清单与纪律遵守率（短线超期未离场次数）。period=week|month|all。数据来自本地账本，账本模块未就绪时返回 ERR-MODULE-001。',
+      '跬步量化·复盘：按周期统计胜率、盈亏比、override 清单，并按象限给出纪律遵守率（期内 override 次数 / 期内有效契约数）与短线超期未离场清单（持仓 >5 交易日，硬红线）。period=week|month|all；asOf 缺省为今天（UTC 自然日，可用参数覆盖以便对账）。数据来自本地账本，账本模块未就绪时返回 ERR-MODULE-001。',
     parameters: {
       period: { type: 'string', enum: ['week', 'month', 'all'], description: '复盘周期，默认 week' },
       quadrant: { type: 'string', enum: ['long', 'stable', 'short'], description: '只看某象限（可选）' },
+      asOf: { type: 'string', description: '复盘基准日 YYYY-MM-DD（可选，默认今天；用于短线 5 日硬期限核验）' },
     },
     output: TEXT_OUTPUT,
     async execute(args) {
@@ -658,27 +659,16 @@ function apply(ctx, config) {
         const ledgerMod = await tryImport('./src/ledger.js');
         if (!ledgerMod || typeof ledgerMod.makeLedger !== 'function') return moduleMissing('账本', './src/ledger.js');
         const ledger = ledgerMod.makeLedger(dataDir);
-        const period = args.period || 'week';
-        const cutoff = new Date();
-        if (period === 'week') cutoff.setDate(cutoff.getDate() - 7);
-        else if (period === 'month') cutoff.setMonth(cutoff.getMonth() - 1);
-        const inPeriod = (d) => !d || period === 'all' || new Date(d) >= cutoff;
-        const trades = (ledger.trades(args.quadrant) || []).filter((t) => inPeriod(t.date));
-        const closed = trades.filter((t) => typeof t.pnl === 'number');
-        const overrides = (ledger.contracts() || []).flatMap((c) => (c.overrides || []).filter((o) => inPeriod(o.at)).map((o) => ({ contractId: c.id, symbol: c.symbol, ...o })));
-        const equity = closed.map((t) => t.pnl);
-        return {
-          ok: true,
-          period,
-          quadrant: args.quadrant || 'all',
-          trades: trades.length,
-          winRate: winRate(closed),
-          payoffRatio: payoffRatio(closed),
-          maxDrawdown: equity.length ? maxDrawdown(equity) : null,
-          overrides,
-          disciplineNote: overrides.length ? `本期有 ${overrides.length} 次契约 override，逐条核对理由` : '本期无契约 override，纪律遵守',
-          footnotes: [DISCLAIMER],
-        };
+        // 统计口径唯一实现在 src/review.js（纯函数，asOf 显式传入；与 /api/kuibuequity/review 共用）
+        const report = reviewReport({
+          trades: ledger.trades(),
+          contracts: ledger.contracts(),
+          positions: ledger.positions(),
+          period: args.period || 'week',
+          quadrant: args.quadrant,
+          asOf: args.asOf || new Date().toISOString().slice(0, 10),
+        });
+        return { ok: true, ...report, footnotes: [DISCLAIMER] };
       } catch (e) {
         return toErr(e);
       }
